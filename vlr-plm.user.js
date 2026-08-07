@@ -4,8 +4,7 @@
 // @version      1.5
 // @description  Stats extractor + Duels
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=vlr.gg
-// @match        https://www.vlr.gg/*
-// @match        https://raiden.oddin.gg/*
+// @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @connect      vlr.gg
