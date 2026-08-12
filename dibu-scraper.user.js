@@ -3,6 +3,7 @@
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
 // @version      1.3.0
 // @description  bb scraper
+// @icon         https://betboom.ru/favicon.ico
 // @author       GG
 // @match        https://betboom.ru/esport/*
 // @run-at       document-start
