@@ -7,8 +7,8 @@
 // @match        https://betboom.ru/esport/*
 // @run-at       document-start
 // @grant        none
-// @updateURL    
-// @downloadURL  
+// @updateURL    https://github.com/Stiztz/tampermonkey-scripts-gg/raw/refs/heads/main/dibu-scraper.user.js
+// @downloadURL  https://github.com/Stiztz/tampermonkey-scripts-gg/raw/refs/heads/main/dibu-scraper.user.js
 // ==/UserScript==
 
 /* eslint-disable no-bitwise */
