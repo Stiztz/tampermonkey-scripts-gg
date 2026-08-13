@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.4.1
+// @version      1.5.0
 // @description  bb scraper
 // @icon         https://betboom.ru/favicon.ico
 // @author       GG
@@ -202,6 +202,29 @@
         osc.stop(t0 + dur + 0.03);
     }
 
+    // Dry percussive hit: filtered noise burst plus a low body thump.
+    function thud() {
+        const ac = audioCtx();
+        if (!ac || S.mute) return;
+        if (ac.state === 'suspended') { try { ac.resume(); } catch (e) { /* noop */ } }
+        const dur = 0.16;
+        const buf = ac.createBuffer(1, Math.floor(ac.sampleRate * dur), ac.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < d.length; i++) {
+            d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 3.2);
+        }
+        const src = ac.createBufferSource();
+        src.buffer = buf;
+        const filt = ac.createBiquadFilter();
+        filt.type = 'lowpass';
+        filt.frequency.setValueAtTime(460, ac.currentTime);
+        const g = ac.createGain();
+        g.gain.setValueAtTime(0.34, ac.currentTime);
+        src.connect(filt); filt.connect(g); g.connect(ac.destination);
+        src.start();
+        beep(88, 0.13, 'sine', 0.2);
+    }
+
     const SFX = {
         // Home kills ring bright and upward, away kills land low and dull, so
         // you can tell who got the frag without looking at the panel.
@@ -209,6 +232,7 @@
         killAway() { beep(392, 0.11, 'sawtooth', 0.11); beep(262, 0.12, 'sawtooth', 0.09, 0.05); },
         roundStart() { beep(523, 0.08, 'sine', 0.13); beep(659, 0.08, 'sine', 0.13, 0.085); beep(784, 0.14, 'sine', 0.14, 0.17); },
         bomb() { for (let i = 0; i < 3; i++) beep(1180, 0.055, 'square', 0.14, i * 0.13); },
+        roundEnd() { thud(); },
     };
 
     function play(name) {
@@ -233,6 +257,9 @@
         activePinned: false,
         userPicked: false,
         retries: new Map(),
+        probe: new Map(),
+        lastProbe: 0,
+        onlyReadable: true,
         gridUrl: null,
         ownSocket: null,
         lastOwnOpen: 0,
@@ -372,6 +399,9 @@
                     tournamentId: node[10],
                     format: node[17] || prev.format || '',
                     start: node[13] || prev.start || '',
+                    // Field 3: 1 = live, 2 = upcoming. Far more reliable than
+                    // comparing the start time against the clock.
+                    live: node[3] === 1,
                 };
                 if (JSON.stringify(prev) !== JSON.stringify(rec)) { S.matches.set(id, rec); changed = true; }
             }
@@ -466,6 +496,12 @@
         if (!matchId) return;
 
         S.retries.delete(matchId);
+        S.probe.set(matchId, { status: 'ok', sentAt: Date.now() });
+
+        // We stay subscribed to every match we have probed, so frames keep
+        // arriving for matches the user is no longer looking at. Sounds must
+        // follow the selection, not the feed.
+        const isActive = matchId === S.active;
 
         let g = S.games.get(matchId);
         if (!g) { g = newGame(matchId); S.games.set(matchId, g); }
@@ -509,14 +545,15 @@
             g.phaseStart = timer[1] || null;
             g.phaseDur = timer[4] || null;
             if (newPhase === 'bomb_has_been_planted') {
-                g.bombPlanted = true; logEvent(g, 'bomb', 'BOMB PLANTED'); play('bomb');
+                g.bombPlanted = true; logEvent(g, 'bomb', 'BOMB PLANTED');
+                if (isActive) play('bomb');
             } else if (newPhase === 'bomb_has_been_exploded') {
                 g.bombPlanted = false; g.lastSpecial = 'exploded'; logEvent(g, 'bomb', 'BOMB EXPLODED');
             } else if (newPhase === 'bomb_has_been_defused') {
                 g.bombPlanted = false; g.lastSpecial = 'defused'; logEvent(g, 'bomb', 'BOMB DEFUSED');
             } else if (newPhase === 'round') {
                 g.bombPlanted = false; g.lastSpecial = null;
-                if (hadPhase) play('roundStart');
+                if (hadPhase && isActive) play('roundStart');
             } else if (newPhase === 'freezetime' || newPhase === 'await_round') {
                 g.bombPlanted = false; g.lastSpecial = null;
             } else if (newPhase === 'round_end') {
@@ -568,6 +605,7 @@
                         });
                         const tName = (g.teams.find(t => t.id === tid) || {}).name || tid;
                         logEvent(g, 'round', `ROUND ${total} — ${tName} wins (${REASON[reason]})`);
+                        if (isActive) play('roundEnd');
                     }
                     g.lastSpecial = null;
                 }
@@ -578,7 +616,7 @@
         const kill = gs[5];
         if (kill && kill[6] && !g.seenKills.has(kill[6])) {
             g.seenKills.add(kill[6]);
-            processKill(g, kill, liveMap);
+            processKill(g, kill, liveMap, isActive);
         }
 
         g.lastUpdate = Date.now();
@@ -595,7 +633,7 @@
         return { nick: steamId ? steamId.slice(-5) : '?', team: '', teamId: null, idx: -1 };
     }
 
-    function processKill(g, kill, liveMap) {
+    function processKill(g, kill, liveMap, isActive) {
         const killer = kill[1] && kill[1][1];
         const assist = kill[2] && kill[2][1];
         let weapon = kill[3] && kill[3][1];
@@ -638,6 +676,7 @@
         logEvent(g, 'kill', `${k.nick} (${weaponName(weapon)}) killed ${v.nick}${hs ? ' · HS' : ''}${aTxt}`,
             k.idx);
 
+        if (!isActive) return;
         if (k.idx === 0) play('killHome');
         else if (k.idx === 1) play('killAway');
     }
@@ -755,6 +794,47 @@
         S.lastOwnOpen = Date.now();
         try { S.ownSocket = new HookedWS(S.gridUrl); }
         catch (e) { S.ownSocket = null; }
+    }
+
+    // Nothing in the tree feed says whether a match has GRID game-state
+    // coverage — the one match that did and the ones that never will carry an
+    // identical set of fields. The only way to know is to subscribe and see who
+    // answers, so probe live matches one at a time and remember the verdict.
+    const PROBE_TIMEOUT = 12000;
+    const PROBE_RETRY = 120000;
+
+    function probeMatches() {
+        const sock = S.gridSockets.find(s => s.readyState === 1);
+        if (!sock) return;
+        const now = Date.now();
+
+        S.probe.forEach(pr => {
+            if (pr.status === 'pending' && now - pr.sentAt > PROBE_TIMEOUT) pr.status = 'none';
+        });
+        if (now - S.lastProbe < 700) return;
+
+        for (const m of S.matches.values()) {
+            if (!m.live) continue;
+            if (S.games.has(m.id)) {
+                if (!S.probe.has(m.id)) S.probe.set(m.id, { status: 'ok', sentAt: now });
+                continue;
+            }
+            const pr = S.probe.get(m.id);
+            if (pr && pr.status === 'pending') continue;
+            // A match that answered nothing may simply not have started its feed
+            // yet, so give it another go much later.
+            if (pr && pr.status === 'none' && now - pr.sentAt < PROBE_RETRY) continue;
+            S.probe.set(m.id, { status: 'pending', sentAt: now });
+            S.lastProbe = now;
+            sendSub(sock, m.id);
+            S.dirty = true;
+            return;                       // one per tick keeps it gentle
+        }
+    }
+
+    function readable(id) {
+        const pr = S.probe.get(id);
+        return S.games.has(id) || (pr && pr.status === 'ok');
     }
 
     function watchdog() {
@@ -876,6 +956,9 @@
 .mh-empty{padding:10px 8px;color:#41536c;font-size:10.5px;text-align:center;line-height:1.55;white-space:pre-line}
 
 /* ---------- match list ---------- */
+.mh-grp{font-size:8.5px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+  color:#5f7390;background:#0b1422;padding:4px 7px 3px;position:sticky;top:0;
+  border-bottom:1px solid #17243a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mh-mrow{display:flex;gap:5px;align-items:center;padding:5px 7px;border-bottom:1px solid #13203399;cursor:pointer}
 .mh-mrow:hover{background:#152238}
 .mh-mrow.mh-sel{background:#152a49;box-shadow:inset 2px 0 0 #4a9eff}
@@ -1079,7 +1162,8 @@
       <div class="mh-body">
         <div class="mh-col" id="mh-left">
           <div class="mh-card" style="flex:1">
-            <div class="mh-h"><span class="grow">Live matches</span></div>
+            <div class="mh-h"><span class="grow">Live matches</span>
+              <button class="mh-gl" id="mh-filt" title="Filter">&#9673;</button></div>
             <div class="mh-scroll" id="mh-matches"></div>
           </div>
         </div>
@@ -1120,6 +1204,12 @@
         root.querySelector('#mh-max').addEventListener('click', toggleMax);
         root.querySelector('#mh-tl').addEventListener('click', () => togglePane('nol', 'hideLeft'));
         root.querySelector('#mh-tr').addEventListener('click', () => togglePane('nor', 'hideRight'));
+        root.querySelector('#mh-filt').addEventListener('click', ev => {
+            ev.stopPropagation();
+            S.onlyReadable = !S.onlyReadable;
+            store('onlyReadable', S.onlyReadable);
+            render();
+        });
         root.querySelector('#mh-wplog').addEventListener('click', ev => {
             ev.stopPropagation();
             S.oddsLogOpen = !S.oddsLogOpen;
@@ -1134,6 +1224,7 @@
         });
 
         S.oddsLogOpen = store('oddsLog') === true;
+        if (store('onlyReadable') === false) S.onlyReadable = false;
         if (store('hideLeft')) root.classList.add('mh-nol');
         if (store('hideRight')) root.classList.add('mh-nor');
         syncPaneButtons();
@@ -1302,41 +1393,77 @@
     // ---------- match list ----------
     function renderMatches() {
         const box = root.querySelector('#mh-matches');
+        const btn = root.querySelector('#mh-filt');
         box.textContent = '';
-        const now = Date.now();
-        const list = Array.from(S.matches.values()).sort((a, b) => {
-            const la = S.games.has(a.id) ? 0 : 1, lb = S.games.has(b.id) ? 0 : 1;
-            if (la !== lb) return la - lb;
-            return String(a.start).localeCompare(String(b.start));
-        });
+        btn.classList.toggle('on', S.onlyReadable);
+        btn.title = S.onlyReadable
+            ? 'Showing only matches with a readable game-state feed — click for all'
+            : 'Showing every match in the feed — click to filter';
+
+        let list = Array.from(S.matches.values());
+        const pending = list.filter(m => m.live && !readable(m.id) &&
+            (S.probe.get(m.id) || {}).status === 'pending').length;
+
+        if (S.onlyReadable) list = list.filter(m => readable(m.id) || m.id === S.active);
+
         if (!list.length) {
-            box.appendChild(el('div', 'mh-empty',
-                S.rx.tree ? 'No matches in the feed yet.' : 'No frames intercepted — reload the page.'));
+            box.appendChild(el('div', 'mh-empty', !S.rx.tree
+                ? 'No frames intercepted — reload the page.'
+                : (pending ? `Checking which matches have a feed…\n${pending} left`
+                    : 'No matches with a readable feed.\nClick the filter to show all.')));
             return;
         }
+
+        // Group by tournament so the list stops reshuffling on every update.
+        const groups = new Map();
         list.forEach(m => {
-            const waiting = m.id === S.active && !S.games.has(m.id);
-            const row = el('div', 'mh-mrow' + (m.id === S.active ? ' mh-sel' : '') +
-                (waiting ? ' mh-nod' : ''));
-            const wrap = el('div');
-            wrap.style.cssText = 'flex:1;min-width:0';
-            wrap.appendChild(el('div', 'mh-mname', `${m.home.short} vs ${m.away.short}`));
-            wrap.appendChild(el('div', 'mh-mmeta',
-                [S.tournaments.get(m.tournamentId), m.format].filter(Boolean).join(' · ') || '—'));
-            row.appendChild(wrap);
+            const name = S.tournaments.get(m.tournamentId) || 'Other';
+            if (!groups.has(name)) groups.set(name, []);
+            groups.get(name).push(m);
+        });
 
-            let tag;
-            if (waiting) {
-                const n = S.retries.get(m.id) || 0;
-                tag = el('div', 'mh-tag nod', n ? `try ${n}` : 'wait');
-                tag.title = 'No game-state feed yet — retrying every 20s.';
-            } else if (S.games.has(m.id)) tag = el('div', 'mh-tag live', 'LIVE');
-            else if (m.start && Date.parse(m.start) <= now) tag = el('div', 'mh-tag live', 'LIVE');
-            else tag = el('div', 'mh-tag up', (m.start || '').slice(11, 16) || '—');
-            row.appendChild(tag);
+        const names = Array.from(groups.keys()).sort((a, b) => a.localeCompare(b));
+        names.forEach(name => {
+            const rows = groups.get(name).sort((a, b) => {
+                if (a.live !== b.live) return a.live ? -1 : 1;
+                const s = String(a.start).localeCompare(String(b.start));
+                return s !== 0 ? s : a.home.short.localeCompare(b.home.short);
+            });
+            const head = el('div', 'mh-grp', name);
+            head.title = `${name} · ${rows.length} match${rows.length > 1 ? 'es' : ''}`;
+            box.appendChild(head);
 
-            row.addEventListener('click', () => { subscribeMatch(m.id); render(); });
-            box.appendChild(row);
+            rows.forEach(m => {
+                const waiting = m.id === S.active && !S.games.has(m.id);
+                const row = el('div', 'mh-mrow' + (m.id === S.active ? ' mh-sel' : '') +
+                    (waiting ? ' mh-nod' : ''));
+                const wrap = el('div');
+                wrap.style.cssText = 'flex:1;min-width:0';
+                wrap.appendChild(el('div', 'mh-mname', `${m.home.short} vs ${m.away.short}`));
+                wrap.appendChild(el('div', 'mh-mmeta', m.format || (m.live ? 'live' : '—')));
+                row.appendChild(wrap);
+
+                let tag;
+                if (waiting) {
+                    const n = S.retries.get(m.id) || 0;
+                    tag = el('div', 'mh-tag nod', n ? `try ${n}` : 'wait');
+                    tag.title = 'No game-state feed yet — retrying every 20s.';
+                } else if (readable(m.id)) {
+                    tag = el('div', 'mh-tag live', 'LIVE');
+                } else if ((S.probe.get(m.id) || {}).status === 'pending') {
+                    tag = el('div', 'mh-tag up', '···');
+                    tag.title = 'Checking for a game-state feed';
+                } else if (m.live) {
+                    tag = el('div', 'mh-tag nod', 'no feed');
+                    tag.title = 'Live, but no GRID game-state feed available';
+                } else {
+                    tag = el('div', 'mh-tag up', (m.start || '').slice(11, 16) || '—');
+                }
+                row.appendChild(tag);
+
+                row.addEventListener('click', () => { subscribeMatch(m.id); render(); });
+                box.appendChild(row);
+            });
         });
     }
 
@@ -1797,6 +1924,7 @@
 
         setInterval(() => { if (S.open && S.dirty) { S.dirty = false; render(); } }, 350);
         setInterval(watchdog, 5000);
+        setInterval(probeMatches, 700);
 
         // Clock ticks separately so the panel isn't repainted 4x/second.
         setInterval(() => {
