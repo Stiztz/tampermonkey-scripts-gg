@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.3.0
+// @version      1.4.0
 // @description  bb scraper
 // @icon         https://betboom.ru/favicon.ico
 // @author       GG
@@ -230,9 +230,12 @@
         games: new Map(),
         odds: new Map(),
         active: null,
-        subscribed: new Set(),
-        noData: new Set(),
-        waiting: new Map(),
+        activePinned: false,
+        userPicked: false,
+        retries: new Map(),
+        gridUrl: null,
+        ownSocket: null,
+        lastOwnOpen: 0,
         selectedMapNum: null,
         expandedPlayer: null,
         wpScope: 'match',
@@ -283,6 +286,7 @@
         const isTree = /tree_ws/.test(url);
 
         if (isGrid) {
+            S.gridUrl = url;
             S.gridSockets.push(ws);
             // The site tears this socket down and rebuilds it between maps. When
             // a fresh one opens, re-assert our own subscription instead of
@@ -293,6 +297,11 @@
             ws.addEventListener('close', () => {
                 S.gridSockets = S.gridSockets.filter(s => s !== ws);
             });
+        }
+        if (isTree && !S.gridUrl) {
+            // Same host and API version, different path — lets us open our own
+            // grid socket if the page never opens one.
+            S.gridUrl = url.replace('/api/tree_ws/', '/api/grid_widget_ws/');
         }
         if (isGrid || isTree) {
             S.rx.sockets++;
@@ -436,12 +445,15 @@
         const matchId = String(payload[1] || '');
         if (!matchId) return;
 
-        if (S.waiting.has(matchId)) { clearTimeout(S.waiting.get(matchId)); S.waiting.delete(matchId); }
-        S.noData.delete(matchId);
+        S.retries.delete(matchId);
 
         let g = S.games.get(matchId);
         if (!g) { g = newGame(matchId); S.games.set(matchId, g); }
-        if (!S.active || !S.games.has(S.active)) S.active = matchId;
+        // Never let a frame for some other match steal the selection. Before
+        // this, a prematch pick with no feed yet would be silently replaced by
+        // whatever match the page happened to be subscribed to, and the
+        // watchdog would then keep retrying the wrong id forever.
+        if (!S.active || !S.activePinned) S.active = matchId;
 
         // NOTE: team field 3 is NOT maps won. It stayed 1/0 across a whole
         // series whose real score went 0:1 -> 1:1 -> 1:2, so it reads as an
@@ -524,6 +536,7 @@
 
         g.lastUpdate = Date.now();
         if (!S.soundReady) setTimeout(() => { S.soundReady = true; }, 2500);
+        reconcileActive();
         S.dirty = true;
     }
 
@@ -651,30 +664,57 @@
 
     function subscribeMatch(matchId) {
         S.active = matchId;
+        S.activePinned = true;
+        S.userPicked = true;
         S.selectedMapNum = null;
         S.expandedPlayer = null;
         S.wpScope = 'match';
+        S.retries.set(matchId, 0);
         S.dirty = true;
         if (S.games.has(matchId)) return;
 
         const sock = S.gridSockets.find(s => s.readyState === 1);
-        if (!sock) { S.noData.add(matchId); return; }
-        if (S.subscribed.has(matchId)) return;
-        S.subscribed.add(matchId);
-        if (!sendSub(sock, matchId)) { S.noData.add(matchId); return; }
-
-        S.waiting.set(matchId, setTimeout(() => {
-            if (!S.games.has(matchId)) { S.noData.add(matchId); S.dirty = true; }
-            S.waiting.delete(matchId);
-        }, 8000));
+        if (sock) sendSub(sock, matchId);
+        // No 8s verdict any more — the watchdog keeps retrying. A match that is
+        // still in prematch simply has no feed *yet*.
     }
 
-    // The site drops game-state pushes between maps (its own widgets go blank
-    // too). Rather than needing a page reload, re-assert the subscription when
-    // the feed goes quiet — a fresh snapshot is exactly what we want anyway.
+    // The site drops game-state pushes between maps and before a match goes
+    // live (its own widgets go blank too). Rather than needing a page reload,
+    // re-assert the subscription whenever the feed is quiet — a fresh snapshot
+    // is exactly what we want anyway.
     const STALE_MS = 20000;
+
+    // A pin taken from the URL is only a guess about which path segment holds
+    // the match id. If the tree feed lists every live match and ours is not
+    // among them, the guess was wrong — drop it rather than showing an empty
+    // panel forever. A match the user actually clicked is never dropped.
+    function reconcileActive() {
+        if (!S.active || !S.activePinned || S.userPicked) return;
+        if (S.matches.size === 0 || S.games.size === 0) return;
+        if (S.matches.has(S.active)) return;
+        S.activePinned = false;
+        S.active = S.games.keys().next().value;
+        S.dirty = true;
+    }
+
+    // If the page never opened a grid socket (no live widget on screen), open
+    // one ourselves. The endpoint takes no handshake beyond the subscription.
+    function ensureGridSocket() {
+        if (S.gridSockets.some(s => s.readyState === 0 || s.readyState === 1)) return;
+        if (!S.gridUrl) return;
+        if (S.ownSocket && (S.ownSocket.readyState === 0 || S.ownSocket.readyState === 1)) return;
+        if (Date.now() - S.lastOwnOpen < STALE_MS) return;
+        S.lastOwnOpen = Date.now();
+        try { S.ownSocket = new HookedWS(S.gridUrl); }
+        catch (e) { S.ownSocket = null; }
+    }
+
     function watchdog() {
         if (!S.active) return;
+
+        reconcileActive();
+        ensureGridSocket();
         const sock = S.gridSockets.find(s => s.readyState === 1);
         if (!sock) return;
         const g = S.games.get(S.active);
@@ -682,7 +722,9 @@
         if (since < STALE_MS) return;
         if (Date.now() - S.lastResub < STALE_MS) return;
         S.lastResub = Date.now();
+        S.retries.set(S.active, (S.retries.get(S.active) || 0) + 1);
         sendSub(sock, S.active);
+        S.dirty = true;
     }
     function staleSeconds() {
         const g = S.active ? S.games.get(S.active) : null;
@@ -784,7 +826,7 @@
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:4px}
 .mh-h span.grow{flex:1;overflow:hidden;text-overflow:ellipsis}
 .mh-scroll{overflow-y:auto;min-height:0}
-.mh-empty{padding:10px 8px;color:#41536c;font-size:10.5px;text-align:center;line-height:1.55}
+.mh-empty{padding:10px 8px;color:#41536c;font-size:10.5px;text-align:center;line-height:1.55;white-space:pre-line}
 
 /* ---------- match list ---------- */
 .mh-mrow{display:flex;gap:5px;align-items:center;padding:5px 7px;border-bottom:1px solid #13203399;cursor:pointer}
@@ -1214,8 +1256,9 @@
             return;
         }
         list.forEach(m => {
+            const waiting = m.id === S.active && !S.games.has(m.id);
             const row = el('div', 'mh-mrow' + (m.id === S.active ? ' mh-sel' : '') +
-                (S.noData.has(m.id) ? ' mh-nod' : ''));
+                (waiting ? ' mh-nod' : ''));
             const wrap = el('div');
             wrap.style.cssText = 'flex:1;min-width:0';
             wrap.appendChild(el('div', 'mh-mname', `${m.home.short} vs ${m.away.short}`));
@@ -1224,8 +1267,11 @@
             row.appendChild(wrap);
 
             let tag;
-            if (S.noData.has(m.id)) tag = el('div', 'mh-tag nod', 'No data');
-            else if (S.games.has(m.id)) tag = el('div', 'mh-tag live', 'LIVE');
+            if (waiting) {
+                const n = S.retries.get(m.id) || 0;
+                tag = el('div', 'mh-tag nod', n ? `try ${n}` : 'wait');
+                tag.title = 'No game-state feed yet — retrying every 20s.';
+            } else if (S.games.has(m.id)) tag = el('div', 'mh-tag live', 'LIVE');
             else if (m.start && Date.parse(m.start) <= now) tag = el('div', 'mh-tag live', 'LIVE');
             else tag = el('div', 'mh-tag up', (m.start || '').slice(11, 16) || '—');
             row.appendChild(tag);
@@ -1328,11 +1374,15 @@
         bg.style.backgroundImage = '';
 
         if (!g) {
-            fg.appendChild(el('div', 'mh-empty',
-                S.active && S.noData.has(S.active)
-                    ? 'No data — no game-state feed for this match.'
-                    : (S.rx.grid ? 'Pick a match.'
-                        : 'No frames yet. Reload the page so the hook installs before the sockets open.')));
+            if (!S.active) {
+                fg.appendChild(el('div', 'mh-empty', S.rx.grid ? 'Pick a match.'
+                    : 'No frames yet. Reload the page so the hook installs before the sockets open.'));
+            } else {
+                const n = S.retries.get(S.active) || 0;
+                fg.appendChild(el('div', 'mh-empty',
+                    'Waiting for the game-state feed.\n' +
+                    (n ? `Retried ${n}\u00d7 · next in <20s` : 'Retrying every 20s')));
+            }
             return;
         }
 
@@ -1622,8 +1672,10 @@
             const t = [S.tournaments.get(meta && meta.tournamentId), meta && meta.format]
                 .filter(Boolean).join(' · ');
             title.textContent = t || `${g.teams[0].name} vs ${g.teams[1].name}`;
-        } else if (S.active && S.noData.has(S.active)) {
-            title.textContent = (meta ? `${meta.home.short} vs ${meta.away.short}` : S.active) + ' — No data';
+        } else if (S.active) {
+            const n = S.retries.get(S.active) || 0;
+            title.textContent = (meta ? `${meta.home.short} vs ${meta.away.short}` : S.active) +
+                (n ? ` — waiting for feed (${n})` : ' — waiting for feed');
         } else {
             title.textContent = 'Waiting for data…';
         }
@@ -1653,7 +1705,7 @@
         buildShell();
 
         const m = location.pathname.match(/\/(\d+)\/?$/);
-        if (m && !S.active) S.active = m[1];
+        if (m && !S.active) { S.active = m[1]; S.activePinned = true; }
 
         setInterval(() => { if (S.open && S.dirty) { S.dirty = false; render(); } }, 350);
         setInterval(watchdog, 5000);
