@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.4.0
+// @version      1.4.1
 // @description  bb scraper
 // @icon         https://betboom.ru/favicon.ico
 // @author       GG
 // @match        https://betboom.ru/esport/*
 // @run-at       document-start
 // @grant        none
-// @updateURL    https://github.com/Stiztz/tampermonkey-scripts-gg/raw/refs/heads/main/dibu-scraper.user.js
-// @downloadURL  https://github.com/Stiztz/tampermonkey-scripts-gg/raw/refs/heads/main/dibu-scraper.user.js
+// @updateURL    https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/dibu-scraper.user.js
+// @downloadURL  https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/dibu-scraper.user.js
 // ==/UserScript==
 
 /* eslint-disable no-bitwise */
@@ -436,6 +436,26 @@
 
     const SIDE = { 'terrorists': 'T', 'counter-terrorists': 'CT' };
 
+    const REASON = { bomb: 'bomb', defuse: 'defuse', elim: 'elimination', time: 'time' };
+
+    // Round-history glyphs. currentColor everywhere so the side class tints them.
+    const RICON = {
+        elim: '<path d="M5.5 1C3.1 1 1.3 2.7 1.3 5.1c0 1.3.6 2.2 1.3 2.7v1.2c0 .5.4.9.9.9h4c.5 0 .9-.4.9-.9V7.8' +
+            'c.7-.5 1.3-1.4 1.3-2.7C9.7 2.7 7.9 1 5.5 1z" fill="currentColor"/>' +
+            '<circle cx="3.8" cy="5" r="1.15" fill="#0e1728"/><circle cx="7.2" cy="5" r="1.15" fill="#0e1728"/>' +
+            '<path d="M4.7 7.6h1.6v2.3H4.7z" fill="#0e1728"/>',
+        bomb: '<path d="M5.5.5l1.15 2.5L9.2 2l-1 2.5 2.3 1.1-2.3 1.1 1 2.5-2.55-1L5.5 10.7 4.35 8.2l-2.55 1 ' +
+            '1-2.5L.5 5.6l2.3-1.1-1-2.5 2.55 1z" fill="currentColor"/>',
+        defuse: '<path d="M2.2 1.2l4.1 4.4M8.8 1.2L4.7 5.6" fill="none" stroke="currentColor" ' +
+            'stroke-width="1.35" stroke-linecap="round"/>' +
+            '<circle cx="2.7" cy="8.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.2"/>' +
+            '<circle cx="8.3" cy="8.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.2"/>',
+        time: '<circle cx="5.5" cy="6" r="4.2" fill="none" stroke="currentColor" stroke-width="1.3"/>' +
+            '<path d="M5.5 3.6V6l1.9 1.1" fill="none" stroke="currentColor" stroke-width="1.3" ' +
+            'stroke-linecap="round"/><path d="M4.1.8h2.8" stroke="currentColor" stroke-width="1.3" ' +
+            'stroke-linecap="round"/>',
+    };
+
     function handleGrid(msg) {
         const payload = msg[4] || msg[5];
         if (!payload || typeof payload !== 'object') return;
@@ -479,27 +499,8 @@
         const liveMap = g.maps.find(m => m.live) || g.maps[g.maps.length - 1];
         if (liveMap) g.liveMapNum = liveMap.num;
 
-        // round history from score deltas
-        if (liveMap) {
-            const mn = liveMap.num;
-            if (!g.prevRounds[mn]) g.prevRounds[mn] = {};
-            if (!g.roundHistory[mn]) g.roundHistory[mn] = [];
-            let total = Object.values(g.prevRounds[mn]).reduce((a, b) => a + b, 0);
-            for (const tid in liveMap.sides) {
-                const now = liveMap.sides[tid].rounds;
-                const before = g.prevRounds[mn][tid];
-                if (before !== undefined && now > before) {
-                    for (let n = before; n < now; n++) {
-                        total += 1;
-                        g.roundHistory[mn].push({ round: total, teamId: tid, side: liveMap.sides[tid].side });
-                        const tName = (g.teams.find(t => t.id === tid) || {}).name || tid;
-                        logEvent(g, 'round', `ROUND ${total} — ${tName} wins`);
-                    }
-                }
-                g.prevRounds[mn][tid] = now;
-            }
-        }
-
+        // Phase first: bomb explode/defuse arrives before (or with) the score
+        // bump, and the round-history block below needs it to label the win.
         const timer = gs[2] || {};
         const newPhase = gs[1];
         if (newPhase !== g.phase) {
@@ -510,13 +511,15 @@
             if (newPhase === 'bomb_has_been_planted') {
                 g.bombPlanted = true; logEvent(g, 'bomb', 'BOMB PLANTED'); play('bomb');
             } else if (newPhase === 'bomb_has_been_exploded') {
-                g.bombPlanted = false; logEvent(g, 'bomb', 'BOMB EXPLODED');
+                g.bombPlanted = false; g.lastSpecial = 'exploded'; logEvent(g, 'bomb', 'BOMB EXPLODED');
             } else if (newPhase === 'bomb_has_been_defused') {
-                g.bombPlanted = false; logEvent(g, 'bomb', 'BOMB DEFUSED');
+                g.bombPlanted = false; g.lastSpecial = 'defused'; logEvent(g, 'bomb', 'BOMB DEFUSED');
             } else if (newPhase === 'round') {
-                g.bombPlanted = false;
+                g.bombPlanted = false; g.lastSpecial = null;
                 if (hadPhase) play('roundStart');
-            } else if (newPhase === 'round_end' || newPhase === 'await_round' || newPhase === 'freezetime') {
+            } else if (newPhase === 'freezetime' || newPhase === 'await_round') {
+                g.bombPlanted = false; g.lastSpecial = null;
+            } else if (newPhase === 'round_end') {
                 g.bombPlanted = false;
             } else if (newPhase === 'finished') {
                 g.bombPlanted = false; logEvent(g, 'phase', 'MATCH FINISHED');
@@ -526,6 +529,50 @@
         } else {
             g.phaseStart = timer[1] || g.phaseStart;
             g.phaseDur = timer[4] || g.phaseDur;
+        }
+
+        // round history from score deltas
+        if (liveMap) {
+            const mn = liveMap.num;
+            if (!g.prevRounds[mn]) g.prevRounds[mn] = {};
+            if (!g.roundHistory[mn]) g.roundHistory[mn] = [];
+            let total = Object.values(g.prevRounds[mn]).reduce((a, b) => a + b, 0);
+            for (const tid in liveMap.sides) {
+                const now = liveMap.sides[tid].rounds;
+                const before = g.prevRounds[mn][tid];
+                if (before !== undefined && now > before) {
+                    // How the round was won: the bomb phases say so outright,
+                    // otherwise a wiped loser means elimination and survivors
+                    // mean the clock ran out.
+                    const loserId = Object.keys(liveMap.sides).find(x => x !== tid);
+                    const loserAlive = loserId
+                        ? Object.values(liveMap.sides[loserId].alive).filter(v => v === 1).length : 0;
+                    let reason;
+                    if (g.lastSpecial === 'exploded') reason = 'bomb';
+                    else if (g.lastSpecial === 'defused') reason = 'defuse';
+                    else if (loserAlive === 0) reason = 'elim';
+                    else reason = 'time';
+
+                    // Anchor the half boundary to the home team's side: it is
+                    // defined every round, unlike the winner's side, which only
+                    // appears on rounds that team actually won.
+                    const homeTeam = g.teams[0];
+                    const homeSide = (homeTeam && liveMap.sides[homeTeam.id])
+                        ? liveMap.sides[homeTeam.id].side : null;
+
+                    for (let n = before; n < now; n++) {
+                        total += 1;
+                        g.roundHistory[mn].push({
+                            round: total, teamId: tid, side: liveMap.sides[tid].side,
+                            homeSide, reason,
+                        });
+                        const tName = (g.teams.find(t => t.id === tid) || {}).name || tid;
+                        logEvent(g, 'round', `ROUND ${total} — ${tName} wins (${REASON[reason]})`);
+                    }
+                    g.lastSpecial = null;
+                }
+                g.prevRounds[mn][tid] = now;
+            }
         }
 
         const kill = gs[5];
@@ -956,10 +1003,22 @@
 .mh-ev.phase span{color:#8ba0bb}
 
 /* ---------- analytics ---------- */
-.mh-bars{display:flex;align-items:flex-end;gap:1.5px;height:38px;padding:5px 7px}
-.mh-bar{flex:1;min-width:2px;border-radius:1px 1px 0 0;background:#22334c}
-.mh-bar.home{background:#4a9eff}
-.mh-bar.away{background:#d4a340}
+.mh-bars{display:flex;gap:5px;padding:5px 6px;align-items:center}
+.mh-rhg{display:flex;flex-direction:column;gap:2px;flex:none}
+.mh-rhs{font-size:8px;font-weight:700;height:15px;min-width:17px;border-radius:2px;
+  display:grid;place-items:center;letter-spacing:.03em}
+.mh-rhs.CT{background:#12233d;color:#6bb0ff}
+.mh-rhs.T{background:#2e2312;color:#e0a441}
+.mh-rhs.none{background:#182640;color:#5f7390}
+.mh-rhscroll{overflow-x:auto;overflow-y:hidden;min-width:0;flex:1;padding-bottom:2px}
+.mh-rhgrid{display:grid;grid-auto-flow:column;grid-auto-columns:15px;
+  grid-template-rows:15px 15px;gap:2px;width:max-content}
+.mh-rhc{display:grid;place-items:center;border-radius:2px;background:#101c2e}
+.mh-rhc.half{box-shadow:inset 2px 0 0 #3c5273}
+.mh-ri{width:11px;height:11px}
+.mh-ri.CT{color:#6bb0ff}
+.mh-ri.T{color:#e0a441}
+.mh-ri.none{color:#7f93ad}
 .mh-sc{background:#142033;border:1px solid #23364f;color:#7f93ad;border-radius:3px;
   font:700 8px/1 inherit;padding:2px 4px;cursor:pointer;letter-spacing:.05em}
 .mh-sc:hover{color:#cfe0f5}
@@ -1489,14 +1548,43 @@
         if (!m) return;
         const hist = g.roundHistory[m.num] || [];
         if (!hist.length) { box.appendChild(el('div', 'mh-empty', 'Fills up from connect.')); return; }
-        const t1 = g.teams[0];
-        hist.forEach(r => {
-            const b = el('div', 'mh-bar ' + (t1 && r.teamId === t1.id ? 'home' : 'away'));
-            b.style.height = (r.side === 'counter-terrorists' ? 100 : 62) + '%';
-            b.title = `Round ${r.round} · ${(g.teams.find(t => t.id === r.teamId) || {}).name || ''}` +
-                ` (${SIDE[r.side] || ''})`;
-            box.appendChild(b);
+
+        // Left gutter: which side each team is on right now.
+        const gutter = el('div', 'mh-rhg');
+        [0, 1].forEach(i => {
+            const s = sideOf(g, g.teams[i]);
+            gutter.appendChild(el('div', 'mh-rhs ' + (s || 'none'), s || '—'));
         });
+        box.appendChild(gutter);
+
+        const scroll = el('div', 'mh-rhscroll');
+        const grid = el('div', 'mh-rhgrid');
+        const t1 = g.teams[0];
+
+        hist.forEach((r, i) => {
+            const winnerRow = (t1 && r.teamId === t1.id) ? 0 : 1;
+            // Data-driven half boundary, so overtime splits work too.
+            const half = i > 0 && r.homeSide && hist[i - 1].homeSide &&
+                hist[i - 1].homeSide !== r.homeSide;
+            [0, 1].forEach(row => {
+                const cell = el('div', 'mh-rhc' + (half ? ' half' : ''));
+                if (row === winnerRow) {
+                    const s = SIDE[r.side] || 'none';
+                    const holder = document.createElement('div');
+                    holder.innerHTML = `<svg class="mh-ri ${s}" viewBox="0 0 11 11">` +
+                        `${RICON[r.reason] || RICON.elim}</svg>`;
+                    cell.appendChild(holder.firstChild);
+                    cell.title = `Round ${r.round} · ` +
+                        `${(g.teams.find(t => t.id === r.teamId) || {}).name || ''} (${s})` +
+                        ` · ${REASON[r.reason] || 'win'}`;
+                }
+                grid.appendChild(cell);
+            });
+        });
+
+        scroll.appendChild(grid);
+        box.appendChild(scroll);
+        scroll.scrollLeft = scroll.scrollWidth;   // keep the latest round in view
     }
 
     // ---------- win probability ----------
