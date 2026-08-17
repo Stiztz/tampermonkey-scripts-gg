@@ -1,15 +1,12 @@
 // ==UserScript==
-// @name         Valorant Minimap
-// @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.7.1
-// @description  minimap
+// @name         bet365 · VALORANT live MINIMAP (standalone)
+// @namespace    kev.dev
+// @version      1.8.0
+// @description  Live minimap off the bet365 zap feed (VALORANT): real map layouts, agent portraits, damage-coloured health bars, shield, weapon, ult (⚡), plus spike plant/defuse tracking with a blinking marker. Independent of the main HUD script.
 // @match        https://*.bet365.com/*
 // @include      /^https?:\/\/[^/]*\bbet365\.[a-z.]+\//
 // @run-at       document-start
 // @grant        none
-// @icon         https://www.google.com/s2/favicons?domain=valorantesports.com
-// @updateURL    https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/minimap-valo.user.js
-// @downloadURL  https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/minimap-valo.user.js
 // ==/UserScript==
 
 /* ============================================================================================
@@ -107,6 +104,8 @@
     s4AsIc: true,           // if S4 isn't learned yet, assume it uses the same ids as IC
     shieldSwap: false,      // swap 32/33 = light/heavy
     defuseRadius: 7,        // % of the map: a live defender inside this radius of the spike counts as "near"
+    showDefusing: true,     // inferred defuse-in-progress badge (see DEF_SINCE)
+    defuseTight: 4,         // % of the map: how close counts as standing ON the spike
     showUltUsed: true,      // keep a dimmed, struck-through bolt on anyone who has cast this round
     ultFx: true,            // agent-specific flourish on cast (Viper's green haze)
     palette: 'valorant',    // side colours: green defenders / red attackers, like bet365's own widget
@@ -326,6 +325,15 @@
   // per-agent flourish when the ult goes off. Viper's is the one worth seeing at a glance, so her
   // icon takes on a green haze; the map is here so others can be added without touching the render.
   const ULT_FX = { viper: '#2fbf6a' };
+
+  // "Defusing" is NOT in the feed - the only thing that ever arrives is the TP=3 marker once the
+  // defuse has already completed. So this is an inference, and it is labelled as one everywhere it
+  // shows up. Two things have to hold at once: a live defender is standing on the planted spike,
+  // AND their position has stopped updating. Defusing pins you in place for 7s, so a defender who
+  // goes still on top of the spike is the best evidence available. It can still be someone simply
+  // holding the site, hence the question mark - it is a strong hint, not a fact.
+  const DEF_SINCE = {};   // name -> timestamp they went still on the spike
+  const DEFUSE_SECS = 7;
   function pushPos(name, x, y) {
     const p = POS[name] || (POS[name] = { trail: [] });
     if (p.x === x && p.y === y) { p.t = p.t || now(); return; }
@@ -358,6 +366,7 @@
     if (!OBJ.planted || OBJ.defused) return;
     OBJ.defused = true; OBJ.defusedBy = who || '';
     OBJ.src += ' - defuse: ' + src;
+    for (const n in DEF_SINCE) delete DEF_SINCE[n];
     flash('✂ SPIKE DEFUSED' + (who ? ' - ' + who : ''), PAL().def);
     paint();
   }
@@ -459,6 +468,18 @@
       hadSX = hasSX;
     }
     if (hasSX && OBJ.planted && OBJ.x == null) { OBJ.x = +sxRaw; OBJ.y = +syRaw; OBJ.src += ' → SX/SY'; }
+    // defuse-in-progress inference (see DEF_SINCE above)
+    if (OBJ.planted && !OBJ.defused && !OBJ.boom && OBJ.x != null) {
+      st.players.forEach(p => {
+        const q = POS[p.name];
+        if (!p.alive || sideRole(p.side) !== 'def' || !q || q.x == null) { delete DEF_SINCE[p.name]; return; }
+        const d = Math.hypot(sc(q.x) - sc(OBJ.x), sc(q.y) - sc(OBJ.y));
+        const still = now() - q.t >= 1200;   // q.t is the last time their position actually CHANGED
+        if (d <= CFG.defuseTight && still) { if (!DEF_SINCE[p.name]) DEF_SINCE[p.name] = q.t; }
+        else delete DEF_SINCE[p.name];
+      });
+    } else for (const n in DEF_SINCE) delete DEF_SINCE[n];
+
     // detonation by timeout
     if (OBJ.planted && !OBJ.defused && !OBJ.boom && (now() - OBJ.at) / 1000 > SPIKE_DUR + 1) { OBJ.boom = true; flash('💥 SPIKE DETONATED', '#ff6b5a'); }
   }
@@ -544,6 +565,14 @@
 .pm.ultfx .pmi::before{content:'';position:absolute;inset:-32%;border-radius:50%;pointer-events:none;z-index:0;opacity:.4;
   background:radial-gradient(circle,var(--fx) 0%,transparent 68%);animation:vmist 2.6s ease-in-out infinite}
 @keyframes vmist{0%,100%{transform:scale(.9);opacity:.6}50%{transform:scale(1.14);opacity:1}}
+.dfb{position:absolute;left:calc(var(--sz)*-.20);bottom:calc(var(--sz)*-.16);width:calc(var(--sz)*.46);height:calc(var(--sz)*.46);border-radius:50%;
+  background:#062a2c;border:1px solid #43d6c4;color:#8ff0e2;display:none;align-items:center;justify-content:center;font-size:calc(var(--sz)*.24);
+  line-height:1;box-shadow:0 0 8px #43d6c480;z-index:3;animation:vdef 1s ease-in-out infinite}
+.dfb.late{border-color:#7dffa8;color:#c6ffd9;box-shadow:0 0 12px #7dffa8cc;animation-duration:.5s}
+@keyframes vdef{0%,100%{transform:scale(.9)}50%{transform:scale(1.12)}}
+#vmmSpike.busy .ic{filter:drop-shadow(0 0 8px #43d6c4)}
+#vmmSpike.busy .rg{border-color:#43d6c4aa;animation-duration:.9s}
+#vmmStat .dfz{color:#8ff0e2;font-weight:800}
 .hpb{width:calc(var(--sz)*1.06);height:3px;background:#00000090;border:1px solid #00000060;border-radius:2px;overflow:hidden;margin-top:2px}
 .hpb i{display:block;height:100%;transition:width .3s,background .3s}
 .shb{width:calc(var(--sz)*1.06);height:2px;background:#00000080;border-radius:2px;overflow:hidden}
@@ -665,7 +694,7 @@
     const roster = st ? st.players.filter(p => p.agent) : [];
     const igCount = {}; roster.forEach(p => { (igCount[p.agent] = igCount[p.agent] || []).push(p.name); });
     SET.innerHTML = `
-      <div class="row">${chk('showNames', 'Names')}${chk('showWeapons', 'Weapon')}${chk('showHp', 'Health')}${chk('showShield', 'Shield')}${chk('showUlt', 'Ult ⚡')}${chk('showUltUsed', 'Ult used')}${chk('ultFx', 'Viper haze')}${chk('showTrails', 'Trails')}${chk('showDead', 'Dead')}${chk('dimStale', 'Dim stale pos')}</div>
+      <div class="row">${chk('showNames', 'Names')}${chk('showWeapons', 'Weapon')}${chk('showHp', 'Health')}${chk('showShield', 'Shield')}${chk('showUlt', 'Ult ⚡')}${chk('showUltUsed', 'Ult used')}${chk('ultFx', 'Viper haze')}${chk('showDefusing', 'Defusing?')}${chk('showTrails', 'Trails')}${chk('showDead', 'Dead')}${chk('dimStale', 'Dim stale pos')}</div>
       <div class="row"><label>Icon</label><input type="range" id="vmSz" min="16" max="60" value="${CFG.size}"><span id="vmSzV">${CFG.size}px</span>
         <label>Map</label><input type="range" id="vmOp" min="0" max="100" value="${Math.round(CFG.mapOp * 100)}"><span id="vmOpV">${Math.round(CFG.mapOp * 100)}%</span></div>
       <div class="hd">Orientation${sl ? ' - ' + esc(sl) : ' (no map detected)'}</div>
@@ -762,7 +791,7 @@
       let el = marks[p.name];
       if (!el) {
         el = document.createElement('div'); el.className = 'pm';
-        el.innerHTML = `<div class="pmi"><div class="av"></div><div class="ultb">⚡</div><div class="spkb">🔻</div></div><div class="hpb"><i></i></div><div class="shb"><i></i></div><div class="pmw"></div><div class="pmn"></div>`;
+        el.innerHTML = `<div class="pmi"><div class="av"></div><div class="ultb">⚡</div><div class="spkb">🔻</div><div class="dfb">🔧</div></div><div class="hpb"><i></i></div><div class="shb"><i></i></div><div class="pmw"></div><div class="pmn"></div>`;
         layer.appendChild(el); marks[p.name] = el;
       }
       const col = sideCol(p.side);
@@ -790,6 +819,15 @@
       const sb = el.querySelector('.spkb');
       sb.style.display = (p.spike && !OBJ.planted && sideRole(p.side) === 'atk') ? 'flex' : 'none';
       sb.title = 'carrying the spike';
+      // defuse-in-progress badge, same corner as the carrier badge (a defender never carries it,
+      // so the two can't collide). Elapsed time is shown against the 7s a defuse takes.
+      const db = el.querySelector('.dfb'), dsince = DEF_SINCE[p.name];
+      if (CFG.showDefusing && dsince) {
+        const el2 = (now() - dsince) / 1000;
+        db.style.display = 'flex';
+        db.classList.toggle('late', el2 >= DEFUSE_SECS * 0.5);
+        db.title = 'possibly defusing - still on the spike for ' + el2.toFixed(1) + 's of ' + DEFUSE_SECS + 's';
+      } else db.style.display = 'none';
       // agent-specific ult flourish (Viper's green haze)
       const fx = (used && CFG.ultFx) ? ULT_FX[slug(AGENTS[p.agent])] : null;
       el.classList.toggle('ultfx', !!fx);
@@ -843,6 +881,7 @@
       const c = xy(OBJ.x, OBJ.y, sl);
       SPK.style.display = 'flex'; SPK.style.left = c.x + '%'; SPK.style.top = c.y + '%';
       SPK.classList.toggle('def', OBJ.defused);
+      SPK.classList.toggle('busy', !OBJ.defused && !OBJ.boom && Object.keys(DEF_SINCE).length > 0);
       SPK.querySelector('.ic').textContent = OBJ.defused ? '✓' : OBJ.boom ? '💥' : '🔻';
       SPK.querySelector('.lb').textContent = OBJ.defused ? 'DEFUSED' : OBJ.boom ? 'BOOM' : (left != null ? '0:' + String(left).padStart(2, '0') : '');
     } else if (!OBJ.planted && OBJ.dropped && CFG.showDead && now() - OBJ.droppedAt < 20000) {
@@ -860,9 +899,15 @@
       cls = 'plant';
       // who is standing on the spike? (live defender inside the radius) -> defuse candidate
       if (OBJ.x != null) {
-        const near = st.players.filter(p => p.alive && sideRole(p.side) === 'def' && POS[p.name] && POS[p.name].x != null &&
-          Math.hypot(sc(POS[p.name].x) - sc(OBJ.x), sc(POS[p.name].y) - sc(OBJ.y)) <= CFG.defuseRadius).map(p => p.name);
-        if (near.length) txt += ' - near: ' + near.join(', ');
+        const busy = Object.keys(DEF_SINCE);
+        if (busy.length) {
+          const best = busy.map(n => ({ n, s: (now() - DEF_SINCE[n]) / 1000 })).sort((a, b) => b.s - a.s)[0];
+          txt += ` - \u{1F527} DEFUSING? ${best.n} ${best.s.toFixed(1)}s/${DEFUSE_SECS}s`;
+        } else {
+          const near = st.players.filter(p => p.alive && sideRole(p.side) === 'def' && POS[p.name] && POS[p.name].x != null &&
+            Math.hypot(sc(POS[p.name].x) - sc(OBJ.x), sc(POS[p.name].y) - sc(OBJ.y)) <= CFG.defuseRadius).map(p => p.name);
+          if (near.length) txt += ' - near: ' + near.join(', ');
+        }
       }
     } else if (OBJ.carrier) txt = '🎒 spike carrier: ' + OBJ.carrier;
     else txt = st.live ? 'round live' : 'between rounds';
