@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Valorant Minimap
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.7.0
+// @version      1.7.1
 // @description  minimap
 // @match        https://*.bet365.com/*
 // @include      /^https?:\/\/[^/]*\bbet365\.[a-z.]+\//
 // @run-at       document-start
 // @grant        none
+// @icon         https://www.google.com/s2/favicons?domain=valorantesports.com
 // @updateURL    https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/minimap-valo.user.js
 // @downloadURL  https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/minimap-valo.user.js
 // ==/UserScript==
