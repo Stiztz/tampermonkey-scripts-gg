@@ -1,12 +1,15 @@
 // ==UserScript==
-// @name         bet365 · VALORANT live MINIMAP (standalone)
-// @namespace    kev.dev
+// @name         Valorant Minimap
+// @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
 // @version      1.8.0
-// @description  Live minimap off the bet365 zap feed (VALORANT): real map layouts, agent portraits, damage-coloured health bars, shield, weapon, ult (⚡), plus spike plant/defuse tracking with a blinking marker. Independent of the main HUD script.
+// @description  minimap
 // @match        https://*.bet365.com/*
 // @include      /^https?:\/\/[^/]*\bbet365\.[a-z.]+\//
 // @run-at       document-start
 // @grant        none
+// @icon         https://www.google.com/s2/favicons?domain=valorantesports.com
+// @updateURL    https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/minimap-valo.user.js
+// @downloadURL  https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/minimap-valo.user.js
 // ==/UserScript==
 
 /* ============================================================================================
