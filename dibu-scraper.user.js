@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.6.2
+// @version      1.6.3
 // @description  bb scraper
 // @icon         https://betboom.ru/favicon.ico
 // @author       GG
@@ -382,22 +382,18 @@
     // semantic and consistent. We only need a two-way market (home/away), which
     // any "winner" scope provides.
     const MARKET_MATCH = 8489;
-    // A scope slug like "map-1", "map1", "m1", "karta-2" — anything that names
-    // a single map. Capture the map number wherever it sits.
-    const MAP_SLUG_RE = /(?:map|karta|карта)[^0-9]*([1-9])/i;
+    // A scope that names a single map, matched from the slug or the human label.
+    // Covers "map-1", "map1", "Карта 2", "Карта 3 — Победитель", and the
+    // number-first Russian form "2-я карта" seen on the page itself.
+    const MAP_SLUG_RE = /(?:(?:map|karta|карта)[^0-9]*([1-9])|([1-9])[^0-9]*(?:map|karta|карта))/i;
 
-    // Prefer the plainest 2-way market when several cover the same scope. Lower
-    // ambiguity roughly tracks "fewer selections", but we can't see that here,
-    // so prefer a market that only ever reports П1/П2 and skip ones that also
-    // carry a draw (П3/Х) — tracked per scope as we learn about them.
     function scopeOf(node) {
         const mid = node[13];
         if (mid === MARKET_MATCH) return 'match';
-        // node[18] is the human scope ("Матч", "Карта 1"), node[22] the slug.
         const slug = typeof node[22] === 'string' ? node[22] : '';
         const label = typeof node[18] === 'string' ? node[18] : '';
         const m = MAP_SLUG_RE.exec(slug) || MAP_SLUG_RE.exec(label);
-        if (m) return 'map-' + m[1];
+        if (m) return 'map-' + (m[1] || m[2]);
         return null;
     }
 
@@ -447,28 +443,20 @@
 
                 const scope = scopeOf(node);
                 if (!scope) return;
-                // Draw selections mean this is a 3-way market; skip it, we only
-                // plot the two-way home/away probability.
-                const hasDraw = node[6] === 'П3' || node[6] === 'Х';
+
+                // Some map-winner markets carry a draw (Х / П3) because a map can
+                // tie on rounds. We only plot the two-way home/away line, so we
+                // simply IGNORE the draw selection and read П1/П2 from whatever
+                // market carries this scope. Crucially this does not depend on
+                // which selection arrives first — the earlier version dropped a
+                // whole scope if the draw selection happened to arrive before
+                // П1/П2, which is why some maps showed and others didn't.
+                if (node[6] !== 'П1' && node[6] !== 'П2') return;
 
                 const id = String(node[2]);
-                const mid = node[13];
                 const o = S.odds.get(id) || { scopes: {} };
                 let e = o.scopes[scope];
-                if (!e) {
-                    if (hasDraw) return;          // don't seed a scope from a 3-way market
-                    e = { mid, p1: null, p2: null, history: [], drawSeen: false };
-                    o.scopes[scope] = e;
-                }
-                if (hasDraw) { e.drawSeen = true; }
-                // If this scope was first seen via a market that also has a draw,
-                // and a cleaner 2-way market for the same scope shows up, switch.
-                if (!hasDraw && e.drawSeen && e.mid !== mid) {
-                    e = { mid, p1: null, p2: null, history: [], drawSeen: false };
-                    o.scopes[scope] = e;
-                } else if (e.mid !== mid && !e.drawSeen) {
-                    return;                        // a different market for a scope we already track cleanly
-                }
+                if (!e) { e = { p1: null, p2: null, history: [] }; o.scopes[scope] = e; }
 
                 if (node[6] === 'П1') e.p1 = node[10];
                 if (node[6] === 'П2') e.p2 = node[10];
