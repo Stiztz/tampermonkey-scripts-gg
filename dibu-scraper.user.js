@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.5.0
+// @version      1.6.1
 // @description  bb scraper
 // @icon         https://betboom.ru/favicon.ico
 // @author       GG
@@ -23,6 +23,9 @@
     'use strict';
 
     const PAGE = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+
+    // Read from the metadata block so it can never drift from @version.
+    const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.6.0';
 
     if (window.top !== window.self) return;
     if (PAGE.__dibuLoaded) return;
@@ -259,6 +262,10 @@
         retries: new Map(),
         probe: new Map(),
         lastProbe: 0,
+        lat: [],
+        latByMatch: new Map(),
+        clockOffset: null,
+        sessionStart: Date.now(),
         onlyReadable: true,
         gridUrl: null,
         ownSocket: null,
@@ -455,6 +462,7 @@
             if (!c) continue;
             if (String(c.name).toLowerCase() === want || String(c.short).toLowerCase() === want) return c.logo;
         }
+        if (!g.orderKnown) return '';
         const idx = g.teams.indexOf(team);
         const c = idx === 0 ? m.home : (idx === 1 ? m.away : null);
         return c ? c.logo : '';
@@ -486,6 +494,33 @@
             'stroke-linecap="round"/>',
     };
 
+    // Home/away is a betting concept: it is defined by the odds feed, where
+    // competitor 16.1 is П1 (home). The game feed has its own slot order, and
+    // the two DO NOT always agree — trusting the slot once made the win
+    // probability attribute П1's number to the wrong team. So map the game
+    // feed's teams onto the odds feed by name, and only fall back when we
+    // cannot verify the mapping.
+    const normName = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    function orderTeams(matchId, teams) {
+        if (teams.length !== 2) return { teams, known: false };
+        const meta = S.matches.get(matchId);
+        if (meta && meta.home && meta.away) {
+            const homeKeys = [normName(meta.home.name), normName(meta.home.short)];
+            const awayKeys = [normName(meta.away.name), normName(meta.away.short)];
+            const a = normName(teams[0].name), b = normName(teams[1].name);
+            const aHome = homeKeys.indexOf(a) >= 0, bHome = homeKeys.indexOf(b) >= 0;
+            const aAway = awayKeys.indexOf(a) >= 0, bAway = awayKeys.indexOf(b) >= 0;
+            if ((aHome && !bHome) || (bAway && !aAway)) return { teams, known: true };
+            if ((bHome && !aHome) || (aAway && !bAway)) return { teams: [teams[1], teams[0]], known: true };
+        }
+        // Secondary signal: team field 3 behaved like an is-home flag in the
+        // captured series. Weaker than a name match, but better than the slot.
+        if (teams[0].flag3 === 1 && teams[1].flag3 !== 1) return { teams, known: false };
+        if (teams[1].flag3 === 1 && teams[0].flag3 !== 1) return { teams: [teams[1], teams[0]], known: false };
+        return { teams, known: false };
+    }
+
     function handleGrid(msg) {
         const payload = msg[4] || msg[5];
         if (!payload || typeof payload !== 'object') return;
@@ -514,10 +549,13 @@
         // NOTE: team field 3 is NOT maps won. It stayed 1/0 across a whole
         // series whose real score went 0:1 -> 1:1 -> 1:2, so it reads as an
         // is-home flag. Series score is derived from the maps instead.
-        g.teams = arr(gs[3]).map(t => ({
+        const rawTeams = arr(gs[3]).map(t => ({
             id: t[1], name: t[2], flag3: t[3] || 0, slot: t[4] || 0,
             players: arr(t[5]).map(p => ({ steam: p[1], nick: p[2] })),
         })).sort((a, b) => a.slot - b.slot);
+        const ord = orderTeams(matchId, rawTeams);
+        g.teams = ord.teams;
+        g.orderKnown = ord.known;
 
         g.maps = arr(gs[4]).map(m => {
             const sides = {};
@@ -541,6 +579,7 @@
         const newPhase = gs[1];
         if (newPhase !== g.phase) {
             const hadPhase = g.phase !== null;
+            if (hadPhase) sampleLatency(timer[1], matchId, isActive);
             g.phase = newPhase;
             g.phaseStart = timer[1] || null;
             g.phaseDur = timer[4] || null;
@@ -573,10 +612,22 @@
             const mn = liveMap.num;
             if (!g.prevRounds[mn]) g.prevRounds[mn] = {};
             if (!g.roundHistory[mn]) g.roundHistory[mn] = [];
-            let total = Object.values(g.prevRounds[mn]).reduce((a, b) => a + b, 0);
+            // Snapshot the score BEFORE this frame's updates. The absolute round
+            // number a win produces is (total score once that win is counted),
+            // computed from the real scoreboard — never a running counter seeded
+            // from wherever we happened to connect. Connecting mid-map used to
+            // seed `total` from the current score yet start the history empty, so
+            // the first recorded win was numbered one too high and could collide
+            // with the next one ("round 2" twice).
+            const scoreBefore = {};
+            let sumBefore = 0;
+            for (const tid in liveMap.sides) {
+                scoreBefore[tid] = g.prevRounds[mn][tid];
+                if (scoreBefore[tid] !== undefined) sumBefore += scoreBefore[tid];
+            }
             for (const tid in liveMap.sides) {
                 const now = liveMap.sides[tid].rounds;
-                const before = g.prevRounds[mn][tid];
+                const before = scoreBefore[tid];
                 if (before !== undefined && now > before) {
                     // How the round was won: the bomb phases say so outright,
                     // otherwise a wiped loser means elimination and survivors
@@ -597,25 +648,36 @@
                     const homeSide = (homeTeam && liveMap.sides[homeTeam.id])
                         ? liveMap.sides[homeTeam.id].side : null;
 
-                    for (let n = before; n < now; n++) {
-                        total += 1;
+                    // Other team's score is fixed within this frame, so each
+                    // increment for `tid` maps to a concrete absolute round.
+                    const otherNow = loserId !== undefined && liveMap.sides[loserId]
+                        ? liveMap.sides[loserId].rounds : 0;
+                    for (let n = before + 1; n <= now; n++) {
+                        const roundNo = n + otherNow;
+                        // Guard against a duplicate if the same win is somehow
+                        // seen twice (re-subscribe replaying a snapshot).
+                        if (g.roundHistory[mn].some(r => r.round === roundNo)) continue;
                         g.roundHistory[mn].push({
-                            round: total, teamId: tid, side: liveMap.sides[tid].side,
+                            round: roundNo, teamId: tid, side: liveMap.sides[tid].side,
                             homeSide, reason,
                         });
                         const tName = (g.teams.find(t => t.id === tid) || {}).name || tid;
-                        logEvent(g, 'round', `ROUND ${total} — ${tName} wins (${REASON[reason]})`);
+                        logEvent(g, 'round', `ROUND ${roundNo} — ${tName} wins (${REASON[reason]})`);
                         if (isActive) play('roundEnd');
                     }
                     g.lastSpecial = null;
                 }
                 g.prevRounds[mn][tid] = now;
             }
+            // keep history ordered by absolute round number
+            g.roundHistory[mn].sort((a, b) => a.round - b.round);
+            void sumBefore;
         }
 
         const kill = gs[5];
         if (kill && kill[6] && !g.seenKills.has(kill[6])) {
             g.seenKills.add(kill[6]);
+            sampleLatency(kill[6], matchId, isActive);
             processKill(g, kill, liveMap, isActive);
         }
 
@@ -623,6 +685,53 @@
         if (!S.soundReady) setTimeout(() => { S.soundReady = true; }, 2500);
         reconcileActive();
         S.dirty = true;
+    }
+
+    // The feed stamps each event at the source, so receivedAt - eventTime is a
+    // direct read of how far behind live we are. Measured across one captured
+    // session this sat at 7.84s +/- 0.094s — a fixed buffer applied upstream,
+    // not network jitter, so it cannot be reduced from here. Worth surfacing so
+    // a change in the buffer is visible rather than silent.
+    function sampleLatency(iso, matchId, isActive) {
+        if (typeof iso !== 'string') return;
+        const t = Date.parse(iso);
+        if (!t) return;
+        const d = (Date.now() - t) / 1000;
+        if (d < 0 || d > 120) return;          // stale snapshot after a re-subscribe
+        if (isActive) {
+            S.lat.push(d);
+            if (S.lat.length > 25) S.lat.shift();
+        }
+        // Per match as well: if every live match shows the same figure the delay
+        // is a betboom-wide buffer; if they differ it comes from the upstream
+        // data provider and picking tournaments would actually matter.
+        let a = S.latByMatch.get(matchId);
+        if (!a) { a = []; S.latByMatch.set(matchId, a); }
+        a.push({ t: Date.now(), d });
+        if (a.length > 400) a.shift();
+    }
+    function medianOf(v) {
+        if (!v || v.length < 3) return null;
+        const s2 = v.slice().sort((a, b) => a - b);
+        return s2[Math.floor(s2.length / 2)];
+    }
+    const latencyMedian = () => medianOf(S.lat);
+    const latencyOf = id => medianOf((S.latByMatch.get(id) || []).map(x => x.d));
+
+    // HTTP Date gives the server's clock to the second, which bounds how much of
+    // the measured delay could just be a wrong local clock.
+    async function checkClock() {
+        try {
+            const t0 = Date.now();
+            const res = await fetch(location.origin + '/', { method: 'HEAD', cache: 'no-store' });
+            const t1 = Date.now();
+            const hdr = res.headers.get('date');
+            if (!hdr) return;
+            const server = Date.parse(hdr);
+            if (!server) return;
+            S.clockOffset = ((t0 + t1) / 2 - server) / 1000;   // + means our clock is ahead
+            S.dirty = true;
+        } catch (e) { /* blocked or offline */ }
     }
 
     function nickOf(g, steamId) {
@@ -916,6 +1025,12 @@
   text-overflow:ellipsis;white-space:nowrap}
 .mh-stale{flex:none;font-size:9px;font-weight:700;color:#0d1420;background:#d4a340;
   padding:1px 5px;border-radius:3px;letter-spacing:.04em}
+.mh-flash{flex:none;font-size:9px;font-weight:600;color:#0d1420;background:#3ddc84;
+  padding:1px 5px;border-radius:3px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;max-width:210px}
+.mh-lat{flex:none;font-size:9px;font-weight:700;color:#7f93ad;background:#132033;
+  padding:1px 4px;border-radius:3px;cursor:help;letter-spacing:.02em}
+.mh-lat.warn{color:#e0a441;background:#241d0e}
 .mh-led{width:7px;height:7px;border-radius:50%;flex:none;background:#3ddc84;cursor:help}
 .mh-led.warn{background:#d4a340}
 .mh-led.err{background:#e0544f}
@@ -1150,7 +1265,10 @@
         <div class="mh-brand">Dibu <b>Scraper</b></div>
         <div class="mh-title" id="mh-title">Waiting for data…</div>
         <div class="mh-stale" id="mh-stale" style="display:none"></div>
+        <div class="mh-flash" id="mh-flash" style="display:none"></div>
+        <div class="mh-lat" id="mh-lat" style="display:none"></div>
         <div class="mh-led" id="mh-led"></div>
+        <button class="mh-gl" id="mh-exp" title="Export latency diagnostics">&#8615;</button>
         <button class="mh-gl snd" id="mh-snd" title="Sounds">&#9834;</button>
         <button class="mh-gl" id="mh-tl" title="Toggle match list (left)">&#9664;</button>
         <button class="mh-gl" id="mh-tr" title="Toggle stats panel (right)">&#9654;</button>
@@ -1192,9 +1310,9 @@
             <button class="mh-gl" id="mh-wplog" title="Show odds history">&#9662;</button></div>
             <div class="mh-wp" id="mh-wp"></div>
             <div class="mh-scroll mh-oddslog" id="mh-oddslog" style="display:none"></div></div>
-          <div class="mh-card" style="flex:1"><div class="mh-h" id="mh-sh1"><span class="grow">Home</span></div>
+          <div class="mh-card" style="flex:1"><div class="mh-h" id="mh-sh1"><span class="grow">Team 1</span></div>
             <div class="mh-scroll" id="mh-s1"></div></div>
-          <div class="mh-card" style="flex:1"><div class="mh-h" id="mh-sh2"><span class="grow">Away</span></div>
+          <div class="mh-card" style="flex:1"><div class="mh-h" id="mh-sh2"><span class="grow">Team 2</span></div>
             <div class="mh-scroll" id="mh-s2"></div></div>
         </div>
       </div>`;
@@ -1204,6 +1322,10 @@
         root.querySelector('#mh-max').addEventListener('click', toggleMax);
         root.querySelector('#mh-tl').addEventListener('click', () => togglePane('nol', 'hideLeft'));
         root.querySelector('#mh-tr').addEventListener('click', () => togglePane('nor', 'hideRight'));
+        root.querySelector('#mh-exp').addEventListener('click', ev => {
+            ev.stopPropagation();
+            exportDiagnostics();
+        });
         root.querySelector('#mh-filt').addEventListener('click', ev => {
             ev.stopPropagation();
             S.onlyReadable = !S.onlyReadable;
@@ -1351,6 +1473,16 @@
         return team.players.filter(p => !active.has(p.steam));
     }
 
+    // Only claim "Home/Away" when the odds feed actually confirmed the mapping.
+    function sideLabel(g, idx) {
+        if (g && g.orderKnown) return idx === 0 ? 'Home' : 'Away';
+        return idx === 0 ? 'Team 1' : 'Team 2';
+    }
+    function sideLabelShort(g, idx) {
+        if (g && g.orderKnown) return idx === 0 ? 'HOME' : 'AWAY';
+        return idx === 0 ? 'T1' : 'T2';
+    }
+
     function seriesScore(g) {
         const out = [0, 0];
         if (!g) return out;
@@ -1378,6 +1510,23 @@
             d.title = `Odds feed only — no game state yet.\ntree ${S.rx.tree} · grid 0 · ws ${S.rx.sockets}`;
         } else {
             d.title = `ws ${S.rx.sockets} · tree ${S.rx.tree} · grid ${S.rx.grid} · ${S.rx.bad} undecoded`;
+        }
+
+        const lt = root.querySelector('#mh-lat');
+        const med = latencyMedian();
+        if (med === null) { lt.style.display = 'none'; }
+        else {
+            lt.style.display = '';
+            lt.textContent = `-${med.toFixed(1)}s`;
+            lt.classList.toggle('warn', med > 15);
+            lt.title = 'How far behind live the game-state feed is, measured from the\n' +
+                'source timestamp on each event. Around 8s is a fixed buffer applied\n' +
+                'upstream and cannot be reduced. The round timer is NOT delayed —\n' +
+                'it is computed against the real clock.\n' +
+                `samples: ${S.lat.length}` +
+                (S.clockOffset === null ? '\nclock vs server: not checked yet'
+                    : `\nclock vs server: ${S.clockOffset >= 0 ? '+' : ''}${S.clockOffset.toFixed(1)}s` +
+                      ` (real delay ~${(med - S.clockOffset).toFixed(1)}s)`);
         }
 
         const st = root.querySelector('#mh-stale');
@@ -1449,7 +1598,11 @@
                     tag = el('div', 'mh-tag nod', n ? `try ${n}` : 'wait');
                     tag.title = 'No game-state feed yet — retrying every 20s.';
                 } else if (readable(m.id)) {
-                    tag = el('div', 'mh-tag live', 'LIVE');
+                    const lm = latencyOf(m.id);
+                    tag = el('div', 'mh-tag live', lm === null ? 'LIVE' : `${lm.toFixed(1)}s`);
+                    tag.title = lm === null ? 'Live' :
+                        `Feed runs ${lm.toFixed(2)}s behind the source clock` +
+                        ` (${(S.latByMatch.get(m.id) || []).length} samples)`;
                 } else if ((S.probe.get(m.id) || {}).status === 'pending') {
                     tag = el('div', 'mh-tag up', '···');
                     tag.title = 'Checking for a game-state feed';
@@ -1496,7 +1649,11 @@
             names.style.cssText = 'min-width:0';
             names.appendChild(el('div', 'mh-tn', t ? t.name : '—'));
             const bench = benchPlayers(g, t);
-            const role = el('div', 'mh-ta', i === 0 ? 'Home' : 'Away');
+            const role = el('div', 'mh-ta', sideLabel(g, i));
+            if (!g.orderKnown) {
+                role.title = 'Could not match this match to the odds feed, so ' +
+                    'home/away is unconfirmed — this is the game feed order.';
+            }
             if (bench.length) {
                 role.textContent += ` · +${bench.length}`;
                 role.title = 'Not on the server: ' + bench.map(p => p.nick).join(', ');
@@ -1680,7 +1837,9 @@
         const gutter = el('div', 'mh-rhg');
         [0, 1].forEach(i => {
             const s = sideOf(g, g.teams[i]);
-            gutter.appendChild(el('div', 'mh-rhs ' + (s || 'none'), s || '—'));
+            const cell = el('div', 'mh-rhs ' + (s || 'none'), s || '—');
+            cell.title = `${sideLabel(g, i)} · ${(g.teams[i] || {}).name || ''}`;
+            gutter.appendChild(cell);
         });
         box.appendChild(gutter);
 
@@ -1769,14 +1928,18 @@
             return b;
         };
         const lbl = el('div', 'mh-wplbl');
-        const l = el('span'); l.appendChild(mk(`HOME ${(last.p * 100).toFixed(0)}%`, g.teams[0]));
-        const r = el('span'); r.appendChild(mk(`${((1 - last.p) * 100).toFixed(0)}% AWAY`, g.teams[1]));
+        const l = el('span');
+        l.appendChild(mk(`${sideLabelShort(g, 0)} ${(last.p * 100).toFixed(0)}%`, g.teams[0]));
+        const r = el('span');
+        r.appendChild(mk(`${((1 - last.p) * 100).toFixed(0)}% ${sideLabelShort(g, 1)}`, g.teams[1]));
         lbl.appendChild(l); lbl.appendChild(r);
         lbl.title = `${(g.teams[0] || {}).name} ${last.o1} · ${last.o2} ${(g.teams[1] || {}).name}`;
         box.appendChild(lbl);
 
         renderOddsLog(e);
     }
+
+    const gameOf = () => (S.active ? S.games.get(S.active) : null);
 
     // Full odds history, newest first, as the decimal odds the feed actually sends.
     function renderOddsLog(e) {
@@ -1792,7 +1955,9 @@
 
         const rows = e.history.slice().reverse();
         const head = el('div', 'mh-ol head');
-        head.innerHTML = '<time>time</time><span>home</span><span>away</span>';
+        head.innerHTML = '<time>time</time>' +
+            `<span>${sideLabelShort(gameOf(), 0).toLowerCase()}</span>` +
+            `<span>${sideLabelShort(gameOf(), 1).toLowerCase()}</span>`;
         log.appendChild(head);
 
         rows.forEach((d, i) => {
@@ -1824,7 +1989,7 @@
         const box = root.querySelector(listId);
         box.textContent = '';
         const t = g && g.teams[idx];
-        head.textContent = t ? `${idx === 0 ? 'Home' : 'Away'} · ${t.name}` : (idx === 0 ? 'Home' : 'Away');
+        head.textContent = t ? `${sideLabel(g, idx)} · ${t.name}` : sideLabel(g, idx);
         if (!t) return;
 
         const m = activeMap(g);
@@ -1876,6 +2041,82 @@
         });
     }
 
+    let flashTimer = null;
+    function flash(msg) {
+        const t = root && root.querySelector('#mh-flash');
+        if (!t) return;
+        t.textContent = msg;
+        t.style.display = '';
+        clearTimeout(flashTimer);
+        flashTimer = setTimeout(() => { t.style.display = 'none'; }, 3500);
+    }
+
+    // Dump every latency sample so a session can be analysed offline: is the
+    // delay identical across matches (betboom-wide buffer) or does it vary by
+    // tournament (upstream provider)?
+    function exportDiagnostics() {
+        const matches = [];
+        S.latByMatch.forEach((samples, id) => {
+            const meta = S.matches.get(id);
+            const ds = samples.map(x => x.d);
+            const mean = ds.reduce((a, b) => a + b, 0) / (ds.length || 1);
+            matches.push({
+                matchId: id,
+                teams: meta ? `${meta.home.short} vs ${meta.away.short}` : null,
+                tournament: meta ? (S.tournaments.get(meta.tournamentId) || null) : null,
+                samples: samples.length,
+                median: medianOf(ds),
+                mean: Number(mean.toFixed(3)),
+                min: Math.min.apply(null, ds),
+                max: Math.max.apply(null, ds),
+                stdev: Number(Math.sqrt(ds.reduce((a, b) => a + (b - mean) * (b - mean), 0) /
+                    (ds.length || 1)).toFixed(4)),
+                raw: samples,
+            });
+        });
+        const report = {
+            script: 'dibu-scraper',
+            version: VERSION,
+            exportedAt: new Date().toISOString(),
+            sessionMinutes: Number(((Date.now() - S.sessionStart) / 60000).toFixed(1)),
+            clockOffsetSeconds: S.clockOffset,
+            clockNote: 'positive = local clock ahead of server; subtract from latencies',
+            frames: S.rx,
+            matches: matches.sort((a, b) => (b.samples || 0) - (a.samples || 0)),
+        };
+        const text = JSON.stringify(report, null, 1);
+        const name = `dibu-latency-${Date.now()}.json`;
+        let url = null;
+        try {
+            url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+        } catch (e) {
+            try { url = 'data:application/json;charset=utf-8,' + encodeURIComponent(text); }
+            catch (e2) { url = null; }
+        }
+        if (!url) {
+            console.error('[Dibu] export failed; report follows', report);
+            flash('Export failed — report logged to console');
+            return;
+        }
+        try {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = name;
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => {
+                a.remove();
+                if (url.indexOf('blob:') === 0) URL.revokeObjectURL(url);
+            }, 5000);
+            const n = report.matches.reduce((x, m) => x + m.samples, 0);
+            flash(`Exported ${n} samples from ${report.matches.length} match(es)`);
+        } catch (e) {
+            console.error('[Dibu] export failed; report follows', report);
+            flash('Export failed — report logged to console');
+        }
+    }
+
     // ---------- master render ----------
     function render() {
         if (!root || !S.open) return;
@@ -1925,6 +2166,8 @@
         setInterval(() => { if (S.open && S.dirty) { S.dirty = false; render(); } }, 350);
         setInterval(watchdog, 5000);
         setInterval(probeMatches, 700);
+        checkClock();
+        setInterval(checkClock, 600000);
 
         // Clock ticks separately so the panel isn't repainted 4x/second.
         setInterval(() => {
