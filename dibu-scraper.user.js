@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.6.1
+// @version      1.6.2
 // @description  bb scraper
 // @icon         https://betboom.ru/favicon.ico
 // @author       GG
@@ -267,6 +267,8 @@
         clockOffset: null,
         sessionStart: Date.now(),
         onlyReadable: true,
+        mktDebug: false,
+        mktSeen: new Map(),
         gridUrl: null,
         ownSocket: null,
         lastOwnOpen: 0,
@@ -374,10 +376,30 @@
         }
     }
 
-    // 8489 = match winner. 8494 / 8595 = map winner (8494 is the plain 2-way,
-    // 8595 is regulation-time and may carry a draw, so 8494 wins when both show up).
+    // Market winner is 8489. Map-winner market IDs are NOT stable across
+    // matches (the CS2 capture showed 8494/8595, but other events use different
+    // IDs), so map markets are detected by their scope SLUG instead — that is
+    // semantic and consistent. We only need a two-way market (home/away), which
+    // any "winner" scope provides.
     const MARKET_MATCH = 8489;
-    const MARKET_MAP = [8494, 8595];
+    // A scope slug like "map-1", "map1", "m1", "karta-2" — anything that names
+    // a single map. Capture the map number wherever it sits.
+    const MAP_SLUG_RE = /(?:map|karta|карта)[^0-9]*([1-9])/i;
+
+    // Prefer the plainest 2-way market when several cover the same scope. Lower
+    // ambiguity roughly tracks "fewer selections", but we can't see that here,
+    // so prefer a market that only ever reports П1/П2 and skip ones that also
+    // carry a draw (П3/Х) — tracked per scope as we learn about them.
+    function scopeOf(node) {
+        const mid = node[13];
+        if (mid === MARKET_MATCH) return 'match';
+        // node[18] is the human scope ("Матч", "Карта 1"), node[22] the slug.
+        const slug = typeof node[22] === 'string' ? node[22] : '';
+        const label = typeof node[18] === 'string' ? node[18] : '';
+        const m = MAP_SLUG_RE.exec(slug) || MAP_SLUG_RE.exec(label);
+        if (m) return 'map-' + m[1];
+        return null;
+    }
 
     function handleTree(msg) {
         let changed = false;
@@ -413,32 +435,46 @@
                 if (JSON.stringify(prev) !== JSON.stringify(rec)) { S.matches.set(id, rec); changed = true; }
             }
 
-            // market: {1:"od:match:...", 2:matchId, 6:code, 10:odds, 13:marketId, 22:scopeSlug}
+            // market: {1:"od:match:...", 2:matchId, 6:code, 10:odds, 13:marketId, 18:label, 22:slug}
             if (typeof node[1] === 'string' && node[1].indexOf('od:match:') === 0 &&
-                typeof node[10] === 'number' && typeof node[2] === 'number') {
-                const mid = node[13];
-                let scope = null;
-                if (mid === MARKET_MATCH) scope = 'match';
-                else if (MARKET_MAP.indexOf(mid) >= 0 && typeof node[22] === 'string' &&
-                    /^map-\d+$/.test(node[22])) scope = node[22];
+                typeof node[10] === 'number' && typeof node[2] === 'number' &&
+                (node[6] === 'П1' || node[6] === 'П2' || node[6] === 'П3' || node[6] === 'Х')) {
+
+                if (S.mktDebug) {
+                    const key = `${node[13]}|${node[18] || ''}|${node[22] || ''}`;
+                    S.mktSeen.set(key, (S.mktSeen.get(key) || 0) + 1);
+                }
+
+                const scope = scopeOf(node);
                 if (!scope) return;
+                // Draw selections mean this is a 3-way market; skip it, we only
+                // plot the two-way home/away probability.
+                const hasDraw = node[6] === 'П3' || node[6] === 'Х';
 
                 const id = String(node[2]);
+                const mid = node[13];
                 const o = S.odds.get(id) || { scopes: {} };
                 let e = o.scopes[scope];
-                if (!e || (e.mid === 8595 && mid === 8494)) {
-                    e = { mid, p1: null, p2: null, history: [] };
+                if (!e) {
+                    if (hasDraw) return;          // don't seed a scope from a 3-way market
+                    e = { mid, p1: null, p2: null, history: [], drawSeen: false };
                     o.scopes[scope] = e;
-                } else if (e.mid !== mid) {
-                    return; // a lesser market for a scope we already track
                 }
+                if (hasDraw) { e.drawSeen = true; }
+                // If this scope was first seen via a market that also has a draw,
+                // and a cleaner 2-way market for the same scope shows up, switch.
+                if (!hasDraw && e.drawSeen && e.mid !== mid) {
+                    e = { mid, p1: null, p2: null, history: [], drawSeen: false };
+                    o.scopes[scope] = e;
+                } else if (e.mid !== mid && !e.drawSeen) {
+                    return;                        // a different market for a scope we already track cleanly
+                }
+
                 if (node[6] === 'П1') e.p1 = node[10];
                 if (node[6] === 'П2') e.p2 = node[10];
                 if (e.p1 > 1 && e.p2 > 1) {
                     const p = (1 / e.p1) / ((1 / e.p1) + (1 / e.p2));
                     const last = e.history[e.history.length - 1];
-                    // Keep the decimal odds too — that is what the feed actually
-                    // sends, and it is what the history log shows.
                     if (!last || last.o1 !== e.p1 || last.o2 !== e.p2) {
                         e.history.push({ t: Date.now(), o1: e.p1, o2: e.p2, p });
                         if (e.history.length > 500) e.history.shift();
@@ -2184,6 +2220,38 @@
         addEventListener('keydown', e => {
             if (e.altKey && (e.key === 'm' || e.key === 'M')) { e.preventDefault(); toggle(); }
         });
+
+        // Console diagnostics for markets: `window.__dibu.markets()` turns on
+        // capture and, on the next call, prints every (marketId | label | slug)
+        // combination the odds feed carried, with how each was classified. Use
+        // it when a match shows fewer win-prob scopes than expected.
+        try {
+            Object.defineProperty(PAGE, '__dibu', {
+                configurable: true,
+                value: {
+                    markets() {
+                        if (!S.mktDebug) {
+                            S.mktDebug = true; S.mktSeen.clear();
+                            console.log('[Dibu] market capture ON — wait ~10s, then run __dibu.markets() again.');
+                            return;
+                        }
+                        const rows = Array.from(S.mktSeen.entries()).map(([k, n]) => {
+                            const [mid, label, slug] = k.split('|');
+                            const fake = { 13: +mid, 18: label, 22: slug };
+                            return { marketId: +mid, label, slug, count: n, classifiedAs: scopeOf(fake) || '(ignored)' };
+                        }).sort((a, b) => b.count - a.count);
+                        console.table(rows);
+                        return rows;
+                    },
+                    scopes() {
+                        const g = S.active ? S.games.get(S.active) : null;
+                        const o = g ? S.odds.get(g.matchId) : (S.active ? S.odds.get(S.active) : null);
+                        return o ? Object.keys(o.scopes) : [];
+                    },
+                    state: () => S,
+                },
+            });
+        } catch (e) { /* noop */ }
         addEventListener('resize', () => { if (root && S.open) applyBox(store('box') || DEFAULT_BOX); });
     }
 
