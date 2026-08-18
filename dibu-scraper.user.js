@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.6.4
+// @version      1.6.6
 // @description  bb scraper
 // @icon         https://betboom.ru/favicon.ico
 // @author       GG
@@ -269,6 +269,7 @@
         onlyReadable: true,
         mktDebug: false,
         mktSeen: new Map(),
+        codeSeen: new Map(),
         gridUrl: null,
         ownSocket: null,
         lastOwnOpen: 0,
@@ -382,6 +383,19 @@
     // semantic and consistent. We only need a two-way market (home/away), which
     // any "winner" scope provides.
     const MARKET_MATCH = 8489;
+
+    // Selection codes, written as escapes ON PURPOSE. The draw arrives as \u0425,
+    // the CYRILLIC Х — a different character from the Latin X (\u0058) that
+    // renders identically, so a `=== 'X'` typed with the wrong keyboard layout
+    // drops every draw price in silence and looks like the feed never sent one.
+    // Same trap for \u041F (П) versus a Latin P. Both spellings are accepted.
+    const SEL = {
+        '\u041F1': 'home', 'P1': 'home',
+        '\u041F2': 'away', 'P2': 'away',
+        '\u0425': 'draw', 'X': 'draw', '\u041F3': 'draw', 'P3': 'draw',
+    };
+    const selOf = code => SEL[code] || null;
+
     // A scope that names a single map, matched from the slug or the human label.
     // Covers "map-1", "map1", "Карта 2", "Карта 3 — Победитель", and the
     // number-first Russian form "2-я карта" seen on the page itself.
@@ -406,6 +420,24 @@
         return null;
     }
 
+    // A complete two-way book MUST sum to more than 100% — that surplus is the
+    // bookmaker's margin. So if our П1/П2 pair sums to LESS, we are not looking
+    // at a whole market: some selection we ignored carries the rest, in practice
+    // the draw on a map that can finish 12-12. Observed live: market 8494 quoted
+    // 1.5/2.4 = 108.3% (a normal 8.3% margin, matching the match winner) while
+    // 8595 quoted 1.65/2.8 = 96.3%, i.e. a 3.7% NEGATIVE margin, which no house
+    // offers. This test needs no label, no market id, no language and no
+    // assumption about the margin, so it is the most reliable signal we have for
+    // finding the clean home/away line.
+    function overround(e) {
+        if (!(e.p1 > 1) || !(e.p2 > 1)) return null;
+        return 1 / e.p1 + 1 / e.p2;
+    }
+    function marginPct(e) {
+        const ov = overround(e);
+        return ov === null ? null : Number(((ov - 1) * 100).toFixed(2));
+    }
+
     // Rank, do not reject: if the ONLY market found for a scope looks like a
     // derivative we still plot it (better than an empty chart), but a real
     // winner market outranks it and takes over the moment it shows up.
@@ -416,6 +448,12 @@
         if (WINNER_RE.test(txt)) r += 4;
         if (NOT_WINNER_RE.test(txt)) r -= 6;
         if (e.history.length) r += 1;              // it actually quotes two ways
+        if (e.p3 > 1) r -= 3;                      // three-way: draw priced apart
+        const ov = overround(e);
+        if (ov !== null) {
+            if (ov >= 1.005 && ov <= 1.30) r += 3;      // a complete two-way book
+            else if (ov < 1.005) r -= 4;                // under 100%: incomplete
+        }
         return r;
     }
 
@@ -471,25 +509,37 @@
             // market: {1:"od:match:...", 2:matchId, 6:code, 10:odds, 13:marketId, 18:label, 22:slug}
             if (typeof node[1] === 'string' && node[1].indexOf('od:match:') === 0 &&
                 typeof node[10] === 'number' && typeof node[2] === 'number' &&
-                (node[6] === 'П1' || node[6] === 'П2' || node[6] === 'П3' || node[6] === 'Х')) {
+                typeof node[6] === 'string') {
+
+                // Census of EVERY selection code the feed uses, understood or
+                // not. When a price we expect never shows up, __dibu.codes()
+                // answers whether the feed sent it at all and under what name,
+                // instead of leaving us to guess. Cheap: one Map write per
+                // selection.
+                const seen = S.codeSeen.get(node[6]) || { code: node[6], n: 0, sample: '' };
+                seen.n++;
+                if (!seen.sample) seen.sample = `${node[13]}|${node[18] || ''}|${node[22] || ''}`;
+                S.codeSeen.set(node[6], seen);
 
                 if (S.mktDebug) {
                     const key = `${node[13]}|${node[18] || ''}|${node[22] || ''}`;
                     S.mktSeen.set(key, (S.mktSeen.get(key) || 0) + 1);
                 }
 
+                const sel = selOf(node[6]);
+                if (!sel) return;
+
                 const scope = scopeOf(node);
                 if (!scope) return;
 
                 // Some map-winner markets carry a draw (Х / П3) because a map can
-                // tie on rounds. We only plot the two-way home/away line, so we
-                // simply IGNORE the draw selection and read П1/П2 from whatever
-                // market carries this scope. Crucially this does not depend on
-                // which selection arrives first — the earlier version dropped a
-                // whole scope if the draw selection happened to arrive before
-                // П1/П2, which is why some maps showed and others didn't.
-                if (node[6] !== 'П1' && node[6] !== 'П2') return;
-
+                // tie on rounds. We still plot only the two-way home/away line,
+                // but the draw price is RECORDED rather than discarded: it is
+                // what tells a three-way line apart from a two-way one, and
+                // without it a three-way market looks like a two-way book priced
+                // below 100%. Note this never gates the scope on arrival order —
+                // an early version dropped a whole scope when the draw arrived
+                // before П1/П2, which is why some maps showed and others didn't.
                 const id = String(node[2]);
                 const mid = String(node[13] === undefined ? '?' : node[13]);
                 const label = typeof node[18] === 'string' ? node[18] : '';
@@ -508,12 +558,22 @@
                 // chart shows.
                 const mkey = scope + '#' + mid;
                 let e = o.markets[mkey];
-                if (!e) { e = { mid, scope, label, slug, p1: null, p2: null, history: [] }; o.markets[mkey] = e; }
+                if (!e) {
+                    e = { mid, scope, label, slug, p1: null, p2: null, p3: null, history: [] };
+                    o.markets[mkey] = e;
+                }
                 if (label) e.label = label;
                 if (slug) e.slug = slug;
 
-                if (node[6] === 'П1') e.p1 = node[10];
-                if (node[6] === 'П2') e.p2 = node[10];
+                if (sel === 'draw') {
+                    e.p3 = node[10];
+                    if (electMarket(o, scope)) changed = true;
+                    S.odds.set(id, o);
+                    return;                        // never plotted, only recorded
+                }
+
+                if (sel === 'home') e.p1 = node[10];
+                if (sel === 'away') e.p2 = node[10];
                 if (e.p1 > 1 && e.p2 > 1) {
                     const p = (1 / e.p1) / ((1 / e.p1) + (1 / e.p2));
                     const last = e.history[e.history.length - 1];
@@ -1988,9 +2048,13 @@
                 sc === 'match' ? 'MATCH' : 'M' + sc.replace('map-', ''));
             const cands = scopeMarkets(g, sc);
             const chosen = S.odds.get(g.matchId).scopes[sc];
+            const mg = chosen ? marginPct(chosen) : null;
             b.title = (sc === 'match' ? 'Match winner' : 'Map ' + sc.replace('map-', '') + ' winner') +
                 `\nmarket ${chosen ? chosen.mid : '?'}` +
                 (chosen && chosen.label ? ` · ${chosen.label}` : '') +
+                (mg === null ? '' : `\nmargin ${mg >= 0 ? '+' : ''}${mg.toFixed(2)}%` +
+                    (mg < 0 ? ' — under 100%, a selection is missing' : '')) +
+                (chosen && chosen.p3 > 1 ? `\ndraw priced at ${chosen.p3} (not plotted)` : '') +
                 (cands.length > 1
                     ? `\n${cands.length} markets claim this scope — run __dibu.oddsMarkets()` +
                       ` to inspect, __dibu.pick('${sc}', id) to force one`
@@ -2320,13 +2384,39 @@
                         if (!o || !o.markets) { console.log('[Dibu] no odds captured yet'); return []; }
                         const rows = Object.keys(o.markets).map(k => {
                             const e = o.markets[k];
+                            const mg = marginPct(e);
                             return {
                                 scope: e.scope, marketId: e.mid, label: e.label, slug: e.slug,
-                                p1: e.p1, p2: e.p2, points: e.history.length,
+                                p1: e.p1, p2: e.p2, draw: e.p3,
+                                // Negative margin = a selection is missing from
+                                // the pair, so this is not a two-way line.
+                                marginPct: mg,
+                                impliedMissing: (mg !== null && mg < 0)
+                                    ? Number((-mg / 100).toFixed(4)) : null,
+                                points: e.history.length,
                                 rank: marketRank(e), chosen: o.scopes[e.scope] === e,
                             };
                         }).sort((a, b) => String(a.scope).localeCompare(String(b.scope)) ||
                             b.rank - a.rank);
+                        console.table(rows);
+                        return rows;
+                    },
+                    // Every selection code the feed has sent, with a sample
+                    // market. Use it when a price we expect is missing: if the
+                    // draw is not in this list the feed never sent one for that
+                    // market; if it is, the code it uses is right here.
+                    codes() {
+                        const rows = Array.from(S.codeSeen.values()).map(c => {
+                            const [mid, label, slug] = String(c.sample).split('|');
+                            return {
+                                code: c.code,
+                                codePoints: Array.from(c.code)
+                                    .map(ch => 'U+' + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0'))
+                                    .join(' '),
+                                readAs: selOf(c.code) || '(ignored)',
+                                count: c.n, sampleMarket: mid, sampleLabel: label, sampleSlug: slug,
+                            };
+                        }).sort((a, b) => b.count - a.count);
                         console.table(rows);
                         return rows;
                     },
