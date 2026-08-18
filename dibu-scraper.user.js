@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.6.3
+// @version      1.6.4
 // @description  bb scraper
 // @icon         https://betboom.ru/favicon.ico
 // @author       GG
@@ -385,7 +385,16 @@
     // A scope that names a single map, matched from the slug or the human label.
     // Covers "map-1", "map1", "Карта 2", "Карта 3 — Победитель", and the
     // number-first Russian form "2-я карта" seen on the page itself.
-    const MAP_SLUG_RE = /(?:(?:map|karta|карта)[^0-9]*([1-9])|([1-9])[^0-9]*(?:map|karta|карта))/i;
+    // The gap between the word and the number is BOUNDED: with an unbounded
+    // [^0-9]* the label "Победитель 1-й половины карты 2" read as map-1.
+    const MAP_SLUG_RE = /(?:(?:map|karta|карт[а-яё]*)[^0-9]{0,3}([1-9])|([1-9])[^0-9]{0,3}(?:map|karta|карт[а-яё]*))/i;
+
+    // Several DIFFERENT markets legitimately name the same map and all of them
+    // carry П1/П2 selections: map winner, round winner, half winner, handicap…
+    // They are kept apart by marketId (see handleTree); these two patterns only
+    // decide WHICH of them is the plain winner line the win-prob chart uses.
+    const WINNER_RE = /(победител|исход|1x2|\bwinner\b|\bmoneyline\b)/i;
+    const NOT_WINNER_RE = /(раунд|половин|тотал|фора|чётн|четн|нечёт|нечет|пистолет|бомб|убийств|овертайм|игрок|\bround\b|\bhalf\b|\btotal\b|\bhandicap\b|\bodd\b|\beven\b|\bpistol\b|\bbomb\b|\bkills?\b|\bfrags?\b|\bovertime\b|\bplayer\b)/i;
 
     function scopeOf(node) {
         const mid = node[13];
@@ -395,6 +404,34 @@
         const m = MAP_SLUG_RE.exec(slug) || MAP_SLUG_RE.exec(label);
         if (m) return 'map-' + (m[1] || m[2]);
         return null;
+    }
+
+    // Rank, do not reject: if the ONLY market found for a scope looks like a
+    // derivative we still plot it (better than an empty chart), but a real
+    // winner market outranks it and takes over the moment it shows up.
+    function marketRank(e) {
+        const txt = `${e.slug || ''} ${e.label || ''}`;
+        let r = 0;
+        if (e.mid === String(MARKET_MATCH)) r += 8;
+        if (WINNER_RE.test(txt)) r += 4;
+        if (NOT_WINNER_RE.test(txt)) r -= 6;
+        if (e.history.length) r += 1;              // it actually quotes two ways
+        return r;
+    }
+
+    // Deterministic pick per scope: a manual pin wins, then the highest rank,
+    // ties broken by insertion order. Only ever an upgrade, so the chart never
+    // ping-pongs between two markets mid-match.
+    function electMarket(o, scope) {
+        if (!o || !o.markets) return false;
+        const cands = Object.keys(o.markets).map(k => o.markets[k]).filter(e => e.scope === scope);
+        if (!cands.length) return false;
+        const forced = store('mkt:' + scope);
+        let best = forced ? (cands.find(e => e.mid === String(forced)) || null) : null;
+        if (!best) cands.forEach(e => { if (!best || marketRank(e) > marketRank(best)) best = e; });
+        if (!best || o.scopes[scope] === best) return false;
+        o.scopes[scope] = best;
+        return true;
     }
 
     function handleTree(msg) {
@@ -454,9 +491,26 @@
                 if (node[6] !== 'П1' && node[6] !== 'П2') return;
 
                 const id = String(node[2]);
-                const o = S.odds.get(id) || { scopes: {} };
-                let e = o.scopes[scope];
-                if (!e) { e = { p1: null, p2: null, history: [] }; o.scopes[scope] = e; }
+                const mid = String(node[13] === undefined ? '?' : node[13]);
+                const label = typeof node[18] === 'string' ? node[18] : '';
+                const slug = typeof node[22] === 'string' ? node[22] : '';
+
+                const o = S.odds.get(id) || { scopes: {}, markets: {} };
+                if (!o.markets) o.markets = {};
+
+                // ONE BUCKET PER MARKET, never per scope alone. betboom quotes
+                // several П1/П2 markets that all name the same map, and folding
+                // them into a single {p1,p2} pair made П1 from one market pair
+                // up with П2 from another: a home price flip-flopping against a
+                // frozen away price, and a plotted probability built from two
+                // different books. Keyed by marketId they can no longer
+                // overwrite each other; electMarket then decides which one the
+                // chart shows.
+                const mkey = scope + '#' + mid;
+                let e = o.markets[mkey];
+                if (!e) { e = { mid, scope, label, slug, p1: null, p2: null, history: [] }; o.markets[mkey] = e; }
+                if (label) e.label = label;
+                if (slug) e.slug = slug;
 
                 if (node[6] === 'П1') e.p1 = node[10];
                 if (node[6] === 'П2') e.p2 = node[10];
@@ -469,6 +523,7 @@
                         changed = true;
                     }
                 }
+                if (electMarket(o, scope)) changed = true;
                 S.odds.set(id, o);
             }
         });
@@ -1909,6 +1964,14 @@
         return out;
     }
 
+    // Every market that claimed this scope, chosen or not — used to warn in the
+    // UI when more than one does.
+    function scopeMarkets(g, scope) {
+        const o = g ? S.odds.get(g.matchId) : null;
+        if (!o || !o.markets) return [];
+        return Object.keys(o.markets).map(k => o.markets[k]).filter(e => e.scope === scope);
+    }
+
     function renderWinProb(g) {
         const sel = root.querySelector('#mh-wpsc');
         const box = root.querySelector('#mh-wp');
@@ -1923,7 +1986,18 @@
         scopes.forEach(sc => {
             const b = el('button', 'mh-sc' + (sc === S.wpScope ? ' on' : ''),
                 sc === 'match' ? 'MATCH' : 'M' + sc.replace('map-', ''));
-            b.title = sc === 'match' ? 'Match winner' : 'Map ' + sc.replace('map-', '') + ' winner';
+            const cands = scopeMarkets(g, sc);
+            const chosen = S.odds.get(g.matchId).scopes[sc];
+            b.title = (sc === 'match' ? 'Match winner' : 'Map ' + sc.replace('map-', '') + ' winner') +
+                `\nmarket ${chosen ? chosen.mid : '?'}` +
+                (chosen && chosen.label ? ` · ${chosen.label}` : '') +
+                (cands.length > 1
+                    ? `\n${cands.length} markets claim this scope — run __dibu.oddsMarkets()` +
+                      ` to inspect, __dibu.pick('${sc}', id) to force one`
+                    : '');
+            // An asterisk means more than one market named this map, so the
+            // chart is showing whichever ranked highest.
+            if (cands.length > 1) b.textContent += '*';
             b.addEventListener('click', ev => {
                 ev.stopPropagation();
                 S.wpScope = sc;
@@ -2235,6 +2309,39 @@
                         const g = S.active ? S.games.get(S.active) : null;
                         const o = g ? S.odds.get(g.matchId) : (S.active ? S.odds.get(S.active) : null);
                         return o ? Object.keys(o.scopes) : [];
+                    },
+                    // Every odds market captured for the selected match, with the
+                    // scope it was classified into and whether the chart is using
+                    // it. Two rows sharing a scope is normal — that is exactly the
+                    // collision that used to corrupt the history.
+                    oddsMarkets() {
+                        const g = S.active ? S.games.get(S.active) : null;
+                        const o = S.odds.get(g ? g.matchId : S.active);
+                        if (!o || !o.markets) { console.log('[Dibu] no odds captured yet'); return []; }
+                        const rows = Object.keys(o.markets).map(k => {
+                            const e = o.markets[k];
+                            return {
+                                scope: e.scope, marketId: e.mid, label: e.label, slug: e.slug,
+                                p1: e.p1, p2: e.p2, points: e.history.length,
+                                rank: marketRank(e), chosen: o.scopes[e.scope] === e,
+                            };
+                        }).sort((a, b) => String(a.scope).localeCompare(String(b.scope)) ||
+                            b.rank - a.rank);
+                        console.table(rows);
+                        return rows;
+                    },
+                    // Force a scope onto a specific market id; survives reloads.
+                    pick(scope, mid) {
+                        store('mkt:' + scope, String(mid));
+                        S.odds.forEach(o => electMarket(o, scope));
+                        S.dirty = true;
+                        console.log(`[Dibu] ${scope} pinned to market ${mid}`);
+                    },
+                    unpick(scope) {
+                        store('mkt:' + scope, '');
+                        S.odds.forEach(o => electMarket(o, scope));
+                        S.dirty = true;
+                        console.log(`[Dibu] ${scope} back to automatic`);
                     },
                     state: () => S,
                 },
