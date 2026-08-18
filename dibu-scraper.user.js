@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.6.6
+// @version      1.6.7
 // @description  bb scraper
 // @icon         https://betboom.ru/favicon.ico
 // @author       GG
