@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Valorant Minimap
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      2.4.0
+// @version      2.6.0
 // @description  minimap
 // @match        https://*.bet365.com/*
 // @include      /^https?:\/\/[^/]*\bbet365\.[a-z.]+\//
@@ -109,6 +109,7 @@
     defuseRadius: 7,        // % of the map: a live defender inside this radius of the spike counts as "near"
     showDefusing: true,     // inferred defuse-in-progress badge (see DEF_SINCE)
     defuseTight: 4,         // % of the map: how close counts as standing ON the spike
+    auraSecs: 5,            // how long the ult aura stays lit on a player
     showZones: true,        // area ults (Killjoy's Lockdown) drawn as a timed circle
     showUltUsed: true,      // keep a dimmed, struck-through bolt on anyone who has cast this round
     ultFx: true,            // agent-specific flourish on cast (Viper's green haze)
@@ -347,7 +348,13 @@
   // Ult usage isn't a field in the feed, but it's derivable: S2 is the player's current ult points
   // and S3 the cost, so a player sitting at full who suddenly drops below it has just cast. Tracked
   // per round; a Set means a second cast in the same round (impossible anyway) can't double-count.
-  const ULT_PREV = {}, ULT_USED = new Set(), ULT_AT = {};
+  const ULT_PREV = {}, ULT_USED = new Set(), ULT_AT = {}, ULT_EV = [];
+  // A charge can also be released by DYING - for sustained ults, death ends them. Those two cases
+  // look identical in the points field, but they are distinguishable by what happened to the player
+  // in the same instant: a drop with full health and still alive is a real ult event; a drop
+  // alongside the death is just the ult being cut short.
+  const ULT_DEATH_WINDOW = 1500;
+  const DEATH_AT = {};
 
   // The ult-used inference assumed S2 (ult points) drops from full when the ult is cast. Watched
   // live, it doesn't: a Viper ulted and the bolt stayed lit for the whole round, so S2 never moved.
@@ -374,7 +381,20 @@
   }
   // per-agent flourish when the ult goes off. Viper's is the one worth seeing at a glance, so her
   // icon takes on a green haze; the map is here so others can be added without touching the render.
+  // A short aura on whoever's ult fired. Blue for everyone; Viper keeps her green, since her ult is
+  // an area her team plays around and it reads faster in its own colour.
+  const ULT_AURA_DEFAULT = '#4ea1f0';
   const ULT_FX = { viper: '#2fbf6a' };
+
+  // WHAT THE CHARGE DROP ACTUALLY MEANS, and it is not the same for every agent.
+  // The only signal available is ult points falling from full. Watched live:
+  //   Killjoy - points drop when Lockdown is PLACED, so the drop marks the cast. Confirmed in play.
+  //   Viper, Jett - points are held for the whole duration and only released when the ult ENDS
+  //     (she dies, or leaves the pit long enough). So for them the drop marks the end, not the start.
+  // That is why a sustained ult never lit anything at the moment it was cast: nothing changes then.
+  // Anything not listed here is assumed to drop on cast, which is the common case.
+  const ULT_DROP_MEANS = { viper: 'end', jett: 'end' };
+  const dropMeans = agent => ULT_DROP_MEANS[slug(agent)] || 'cast';
 
   // Ults that occupy an AREA get a circle on the map for as long as they last. The feed carries no
   // utility positions at all, so the centre is the agent's OWN position at the moment of the cast -
@@ -383,11 +403,13 @@
   // radiusPct is a share of the map width, not game units: Riot's per-map coordinate multipliers
   // would give a true scale, but only Summit's are on hand, so this is tunable by eye instead.
   const ULT_ZONES = {
-    killjoy: { ability: 'Lockdown', windup: 13, active: 8, radiusPct: 9, col: '#ffd75e' },
+    killjoy: { ability: 'Lockdown', windup: 13, active: 8, radiusPct: 13, col: '#ffd75e' },
   };
   let ZONES = [];   // {player, key, x, y, at, manual}
   function castZone(p, manual) {
     const key = slug(AGENTS[p.agent]); const z = ULT_ZONES[key]; if (!z) return false;
+    // an automatic placement is only trustworthy for agents whose charge drops at the cast
+    if (!manual && dropMeans(AGENTS[p.agent]) === 'end') return false;
     if (ZONES.some(v => v.player === p.name)) return false;         // one per player per round
     const q = POS[p.name]; if (!q || q.x == null) return false;      // no position, nothing to place
     ZONES.push({ player: p.name, key, x: q.x, y: q.y, at: now(), manual: !!manual });
@@ -476,7 +498,7 @@
     // map change: round numbers restart, so the dedup sets must be cleared or map 2's
     // events get swallowed as duplicates of map 1's
     const mk2 = st.E + '|' + (st.map || '');
-    if (mk2 !== mapKey) { mapKey = mk2; seenKills.clear(); seenMarks.clear(); for (const n in POS) delete POS[n]; clearMarks(); OBJ = resetObj(st.round); prevHist = null; hadSX = false; liveAt = 0; ULT_USED.clear(); ZONES = []; for (const n in ULT_PREV) delete ULT_PREV[n]; }
+    if (mk2 !== mapKey) { mapKey = mk2; seenKills.clear(); seenMarks.clear(); for (const n in POS) delete POS[n]; clearMarks(); OBJ = resetObj(st.round); prevHist = null; hadSX = false; liveAt = 0; ULT_USED.clear(); ZONES = []; for (const n in DEATH_AT) delete DEATH_AT[n]; for (const n in ULT_PREV) delete ULT_PREV[n]; }
     // round reset: on round number AND on the freezetime->live edge, because when CP doesn't
     // change (or changes late) the objective state used to bleed into the next round
     const wentLive = st.live && prevLive === false;
@@ -512,8 +534,16 @@
     try { logFields(E, st); } catch (e) { ERR.fieldlog = String(e && e.message || e); }
     st.players.forEach(p => {
       const q = ULT_PREV[p.name];
-      if (q && p.ultMax > 0 && q.ultMax > 0 && q.ult >= q.ultMax && p.ult < q.ult) { ULT_USED.add(p.name); ULT_AT[p.name] = now(); castZone(p, false); }
-      ULT_PREV[p.name] = { ult: p.ult, ultMax: p.ultMax };
+      if (q && p.ultMax > 0 && q.ultMax > 0 && q.ult >= q.ultMax && p.ult < q.ult) {
+        const died = !p.alive || (q.alive && !p.alive) || (DEATH_AT[p.name] && now() - DEATH_AT[p.name] < ULT_DEATH_WINDOW);
+        ULT_USED.add(p.name);
+        ULT_AT[p.name] = died ? 0 : now();          // no aura for a charge released by dying
+        ULT_EV.push({ t: new Date().toLocaleTimeString([], { hour12: false }), round: st.round, player: p.name, agent: AGENTS[p.agent] || ('IG ' + p.agent), from: q.ult, to: p.ult, alive: p.alive, cause: died ? 'died' : dropMeans(AGENTS[p.agent]) === 'end' ? 'ult ended' : 'cast' });
+        if (ULT_EV.length > 80) ULT_EV.shift();
+        if (!died) castZone(p, false);
+      }
+      if (q && q.alive && !p.alive) DEATH_AT[p.name] = now();
+      ULT_PREV[p.name] = { ult: p.ult, ultMax: p.ultMax, alive: p.alive };
     });
     if (carrier) {
       // somebody is holding it again, so the "dropped here" guess is stale - clearing this is what
@@ -648,7 +678,7 @@
 .dfb.late{border-color:#7dffa8;color:#c6ffd9;box-shadow:0 0 12px #7dffa8cc;animation-duration:.5s}
 @keyframes vdef{0%,100%{transform:scale(.9)}50%{transform:scale(1.12)}}
 .zone{position:absolute;transform:translate(-50%,-50%);border-radius:50%;pointer-events:none;z-index:1;
-  display:flex;align-items:flex-start;justify-content:center;transition:width .5s linear,height .5s linear}
+  display:flex;align-items:flex-start;justify-content:center}
 .zone.winding{border:2px dashed var(--zc);background:radial-gradient(circle,transparent 58%,var(--zc) 140%);opacity:.5}
 .zone.live{border:2px solid var(--zc);background:radial-gradient(circle,transparent 45%,var(--zc) 165%);opacity:.85;
   box-shadow:0 0 14px -2px var(--zc);animation:vzone 1.1s ease-in-out infinite}
@@ -804,7 +834,7 @@
       }).join('') : (st ? '<div style="color:#6f7a8a">no agent ids yet</div>' : '<div style="color:#6f7a8a">no live match</div>')}
       <div class="row" style="color:#6f7a8a;margin-top:4px">bet365 burns the agent art into the video stream, so it can't be read from the page. Label each IG once here - the id is stable, so portraits show automatically from then on, in this panel and in the HUD.</div>
       <div class="hd">Console</div>
-      <div class="row" style="color:#6f7a8a">vm.explore() · vm.coords() · vm.dump() · vm.pos() · vm.diag()</div>`;
+      <div class="row" style="color:#6f7a8a">vm.ultevents() · vm.cast() · vm.fieldlog() · vm.pos() · vm.diag()</div>`;
     SET.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { const k = b.dataset.t; CFG[k] = !CFG[k]; saveCfg(); renderSet(); paint(true); });
     const msel = SET.querySelector('#vmMapSel');
     if (msel) msel.onchange = () => { CFG.mapOverride = msel.value; saveCfg(); try { sample(); } catch (e) {} renderSet(); paint(true); };
@@ -903,7 +933,9 @@
       const ub = el.querySelector('.ultb'), ready = p.ultMax > 0 && p.ult >= p.ultMax, used = ULT_USED.has(p.name);
       ub.style.display = (CFG.showUlt && (ready || (used && CFG.showUltUsed))) ? 'flex' : 'none';
       ub.classList.toggle('used', !ready && used);
-      ub.title = ready ? 'ult ready' : used ? 'ult used this round' : '';
+      ub.title = ready ? 'ult ready'
+        : used ? (dropMeans(AGENTS[p.agent]) === 'end' ? 'ult charge released - for this agent that means the ult ENDED, not that it just started' : 'ult used this round')
+        : '';
       // objective carrier (spike / bomb), bottom-left, mirroring the ult badge in the opposite corner
       const sb = el.querySelector('.spkb');
       sb.style.display = (p.spike && !OBJ.planted && sideRole(p.side) === 'atk') ? 'flex' : 'none';
@@ -919,7 +951,11 @@
         db.title = 'possibly defusing - still on the ' + GAME.obj.toLowerCase() + ' for ' + el2.toFixed(1) + 's of ' + defuseSecs() + 's';
       } else db.style.display = 'none';
       // agent-specific ult flourish (Viper's green haze)
-      const fx = (used && CFG.ultFx) ? ULT_FX[slug(AGENTS[p.agent])] : null;
+      // driven by WHEN it fired, not by whether it fired this round, so the aura fades on its own
+      const firedAt = ULT_AT[p.name];
+      const recent = firedAt && (now() - firedAt) < CFG.auraSecs * 1000;
+      const fx = (recent && CFG.ultFx) ? (ULT_FX[slug(AGENTS[p.agent])] || ULT_AURA_DEFAULT) : null;
+      if (fx) el.title = dropMeans(AGENTS[p.agent]) === 'end' ? p.name + ': ult just ENDED' : p.name + ': ult just cast';
       el.classList.toggle('ultfx', !!fx);
       if (fx) el.style.setProperty('--fx', fx);
       // health
@@ -959,11 +995,13 @@
         const winding = el2 < def.windup;
         const c = xy(z.x, z.y, sl);
         // the sphere grows through the windup, then sits at full size while it detains
-        const grow = winding ? 0.35 + 0.65 * (el2 / def.windup) : 1;
-        const r = def.radiusPct * grow;
+        // Fixed size from the moment it lands. The device does wind up, but the area it will cover
+        // is decided at placement, and that area is what is useful to see - a circle creeping
+        // outwards reads as if the danger zone were still small, which is backwards.
+        const r = def.radiusPct;
         const left = Math.max(0, Math.round((winding ? def.windup - el2 : def.windup + def.active - el2)));
         const d = document.createElement('div');
-        d.className = 'zone' + (winding ? ' winding' : ' live');
+        d.className = 'zone' + (winding ? ' winding' : ' live');   // same size either way, only the styling differs
         d.style.left = c.x + '%'; d.style.top = c.y + '%';
         d.style.width = d.style.height = (r * 2) + '%';
         d.style.setProperty('--zc', def.col);
@@ -1155,6 +1193,14 @@
       console.log('[vm] ' + z.ability + ': radius ' + z.radiusPct + '% of the map, ' + z.windup + 's windup + ' + z.active + 's active');
       return z;
     },
+    // Every charge release seen this session, with what caused it. This is the log to check after
+    // an ult on stream: 'cast' means the drop marked the start, 'ult ended' means it marked the end
+    // (Viper, Jett), and 'died' means the charge was simply cut short by the player dying.
+    ultevents: () => {
+      if (!ULT_EV.length) return console.warn('[vm] no charge releases seen yet');
+      console.log('%c[vm] ult charge releases', 'color:#4ea1f0;font-weight:bold');
+      console.table(ULT_EV); return ULT_EV;
+    },
     ults: () => {
       const st = LAST; if (!st) return console.warn('[vm] no live match');
       const F = GAME.f;
@@ -1163,6 +1209,7 @@
       console.table(cur);
       const moves = FIELDLOG.filter(r => r.field === F.ult || r.field === F.ultMax);
       console.log('%cchanges to those fields so far: ' + moves.length, 'color:#09c');
+      console.log('%cRemember what a drop means per agent: Killjoy releases the charge when she PLACES Lockdown, but Viper and Jett hold it for the whole ult and only release it when it ENDS. So for those two, a drop here is the ult finishing.', 'color:#09c');
       if (moves.length) console.table(moves.slice(-40));
       else console.log('%cnone at all - which is the thing to report: if the points never move, an ult cast is not visible in this feed and the badge cannot work off it.', 'color:#f90');
       return { cur, moves };
