@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Valorant Minimap
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      2.3.0
+// @version      2.4.0
 // @description  minimap
 // @match        https://*.bet365.com/*
 // @include      /^https?:\/\/[^/]*\bbet365\.[a-z.]+\//
@@ -109,6 +109,7 @@
     defuseRadius: 7,        // % of the map: a live defender inside this radius of the spike counts as "near"
     showDefusing: true,     // inferred defuse-in-progress badge (see DEF_SINCE)
     defuseTight: 4,         // % of the map: how close counts as standing ON the spike
+    showZones: true,        // area ults (Killjoy's Lockdown) drawn as a timed circle
     showUltUsed: true,      // keep a dimmed, struck-through bolt on anyone who has cast this round
     ultFx: true,            // agent-specific flourish on cast (Viper's green haze)
     mapOverride: '',        // used only when the feed sends no map name
@@ -375,6 +376,26 @@
   // icon takes on a green haze; the map is here so others can be added without touching the render.
   const ULT_FX = { viper: '#2fbf6a' };
 
+  // Ults that occupy an AREA get a circle on the map for as long as they last. The feed carries no
+  // utility positions at all, so the centre is the agent's OWN position at the moment of the cast -
+  // which for Killjoy is close, since Lockdown is planted at her feet or just in front of her.
+  // Timings are the real ability's: Lockdown winds up for 13s, then detains for 8s.
+  // radiusPct is a share of the map width, not game units: Riot's per-map coordinate multipliers
+  // would give a true scale, but only Summit's are on hand, so this is tunable by eye instead.
+  const ULT_ZONES = {
+    killjoy: { ability: 'Lockdown', windup: 13, active: 8, radiusPct: 9, col: '#ffd75e' },
+  };
+  let ZONES = [];   // {player, key, x, y, at, manual}
+  function castZone(p, manual) {
+    const key = slug(AGENTS[p.agent]); const z = ULT_ZONES[key]; if (!z) return false;
+    if (ZONES.some(v => v.player === p.name)) return false;         // one per player per round
+    const q = POS[p.name]; if (!q || q.x == null) return false;      // no position, nothing to place
+    ZONES.push({ player: p.name, key, x: q.x, y: q.y, at: now(), manual: !!manual });
+    flash(z.ability + ' - ' + p.name + (manual ? '' : ''), z.col, 3000);
+    paint(true); return true;
+  }
+  const zoneLife = z => (ULT_ZONES[z.key].windup + ULT_ZONES[z.key].active);
+
   // "Defusing" is NOT in the feed - the only thing that ever arrives is the TP=3 marker once the
   // defuse has already completed. So this is an inference, and it is labelled as one everywhere it
   // shows up. Two things have to hold at once: a live defender is standing on the planted spike,
@@ -455,12 +476,12 @@
     // map change: round numbers restart, so the dedup sets must be cleared or map 2's
     // events get swallowed as duplicates of map 1's
     const mk2 = st.E + '|' + (st.map || '');
-    if (mk2 !== mapKey) { mapKey = mk2; seenKills.clear(); seenMarks.clear(); for (const n in POS) delete POS[n]; clearMarks(); OBJ = resetObj(st.round); prevHist = null; hadSX = false; liveAt = 0; ULT_USED.clear(); for (const n in ULT_PREV) delete ULT_PREV[n]; }
+    if (mk2 !== mapKey) { mapKey = mk2; seenKills.clear(); seenMarks.clear(); for (const n in POS) delete POS[n]; clearMarks(); OBJ = resetObj(st.round); prevHist = null; hadSX = false; liveAt = 0; ULT_USED.clear(); ZONES = []; for (const n in ULT_PREV) delete ULT_PREV[n]; }
     // round reset: on round number AND on the freezetime->live edge, because when CP doesn't
     // change (or changes late) the objective state used to bleed into the next round
     const wentLive = st.live && prevLive === false;
     if (st.round !== prevRound || wentLive) {
-      OBJ = resetObj(st.round); hadSX = false; ULT_USED.clear();
+      OBJ = resetObj(st.round); hadSX = false; ULT_USED.clear(); ZONES = [];
       for (const n in POS) if (POS[n]) POS[n].trail.length = 0;
       prevRound = st.round;
     }
@@ -491,7 +512,7 @@
     try { logFields(E, st); } catch (e) { ERR.fieldlog = String(e && e.message || e); }
     st.players.forEach(p => {
       const q = ULT_PREV[p.name];
-      if (q && p.ultMax > 0 && q.ultMax > 0 && q.ult >= q.ultMax && p.ult < q.ult) { ULT_USED.add(p.name); ULT_AT[p.name] = now(); }
+      if (q && p.ultMax > 0 && q.ultMax > 0 && q.ult >= q.ultMax && p.ult < q.ult) { ULT_USED.add(p.name); ULT_AT[p.name] = now(); castZone(p, false); }
       ULT_PREV[p.name] = { ult: p.ult, ultMax: p.ultMax };
     });
     if (carrier) {
@@ -626,6 +647,14 @@
   line-height:1;box-shadow:0 0 8px #43d6c480;z-index:3;animation:vdef 1s ease-in-out infinite}
 .dfb.late{border-color:#7dffa8;color:#c6ffd9;box-shadow:0 0 12px #7dffa8cc;animation-duration:.5s}
 @keyframes vdef{0%,100%{transform:scale(.9)}50%{transform:scale(1.12)}}
+.zone{position:absolute;transform:translate(-50%,-50%);border-radius:50%;pointer-events:none;z-index:1;
+  display:flex;align-items:flex-start;justify-content:center;transition:width .5s linear,height .5s linear}
+.zone.winding{border:2px dashed var(--zc);background:radial-gradient(circle,transparent 58%,var(--zc) 140%);opacity:.5}
+.zone.live{border:2px solid var(--zc);background:radial-gradient(circle,transparent 45%,var(--zc) 165%);opacity:.85;
+  box-shadow:0 0 14px -2px var(--zc);animation:vzone 1.1s ease-in-out infinite}
+.zone .zlb{margin-top:-16px;font-size:9px;font-weight:800;line-height:1.15;text-align:center;color:var(--zc);
+  text-shadow:0 1px 3px #000,0 0 6px #000;white-space:nowrap}
+@keyframes vzone{0%,100%{opacity:.72}50%{opacity:1}}
 #vmmSpike.busy .ic{filter:drop-shadow(0 0 8px #43d6c4)}
 #vmmSpike.busy .rg{border-color:#43d6c4aa;animation-duration:.9s}
 #vmmStat .dfz{color:#8ff0e2;font-weight:800}
@@ -750,7 +779,7 @@
     const roster = st ? st.players.filter(p => p.agent) : [];
     const igCount = {}; roster.forEach(p => { (igCount[p.agent] = igCount[p.agent] || []).push(p.name); });
     SET.innerHTML = `
-      <div class="row">${chk('showNames', 'Names')}${chk('showWeapons', 'Weapon')}${chk('showHp', 'Health')}${chk('showShield', 'Shield')}${chk('showUlt', 'Ult ⚡')}${chk('showUltUsed', 'Ult used')}${chk('ultFx', 'Viper haze')}${chk('showDefusing', 'Defusing?')}${chk('showTrails', 'Trails')}${chk('showDead', 'Dead')}${chk('dimStale', 'Dim stale pos')}</div>
+      <div class="row">${chk('showNames', 'Names')}${chk('showWeapons', 'Weapon')}${chk('showHp', 'Health')}${chk('showShield', 'Shield')}${chk('showUlt', 'Ult ⚡')}${chk('showUltUsed', 'Ult used')}${chk('ultFx', 'Viper haze')}${chk('showZones', 'Ult zones')}${chk('showDefusing', 'Defusing?')}${chk('showTrails', 'Trails')}${chk('showDead', 'Dead')}${chk('dimStale', 'Dim stale pos')}</div>
       <div class="row"><label>Icon</label><input type="range" id="vmSz" min="16" max="60" value="${CFG.size}"><span id="vmSzV">${CFG.size}px</span>
         <label>Map</label><input type="range" id="vmOp" min="0" max="100" value="${Math.round(CFG.mapOp * 100)}"><span id="vmOpV">${Math.round(CFG.mapOp * 100)}%</span></div>
       <div class="hd">Orientation${sl ? ' - ' + esc(sl) : (st && st.map ? ' - no layout stored for ' + esc(st.map) : ' - no map name in the feed')}</div>
@@ -921,6 +950,28 @@
     });
     Object.keys(marks).forEach(n => { if (!seen.has(n)) { marks[n].remove(); delete marks[n]; } });
 
+    // ---- ult zones ----
+    layer.querySelectorAll('.zone').forEach(e => e.remove());
+    if (CFG.showZones) {
+      ZONES = ZONES.filter(z => (now() - z.at) / 1000 < zoneLife(z));   // no grace period: it disappears exactly when the ability ends
+      ZONES.forEach(z => {
+        const def = ULT_ZONES[z.key], el2 = (now() - z.at) / 1000;
+        const winding = el2 < def.windup;
+        const c = xy(z.x, z.y, sl);
+        // the sphere grows through the windup, then sits at full size while it detains
+        const grow = winding ? 0.35 + 0.65 * (el2 / def.windup) : 1;
+        const r = def.radiusPct * grow;
+        const left = Math.max(0, Math.round((winding ? def.windup - el2 : def.windup + def.active - el2)));
+        const d = document.createElement('div');
+        d.className = 'zone' + (winding ? ' winding' : ' live');
+        d.style.left = c.x + '%'; d.style.top = c.y + '%';
+        d.style.width = d.style.height = (r * 2) + '%';
+        d.style.setProperty('--zc', def.col);
+        d.innerHTML = `<span class="zlb">${esc(def.ability)} · ${z.player}${z.manual ? ' ?' : ''}<br>${winding ? 'winding ' : ''}${left}s</span>`;
+        layer.appendChild(d);
+      });
+    }
+
     // ---- trails ----
     layer.querySelectorAll('.tr').forEach(e => e.remove());
     if (CFG.showTrails) {
@@ -1081,6 +1132,29 @@
       return rows;
     },
     // just the ult fields, current values plus every change seen this session
+    // Place an area-ult circle by hand. The feed may not expose the cast at all (see vm.ults), so
+    // this is the reliable way to use it: call it the moment you see the ult go off on stream.
+    cast: (who) => {
+      const st = LAST; if (!st) return console.warn('[vm] no live match');
+      if (!who) { ZONES = []; paint(true); return console.log('[vm] zones cleared'); }
+      const p = st.players.find(x => x.name.toLowerCase() === String(who).toLowerCase()) ||
+                st.players.find(x => x.name.toLowerCase().indexOf(String(who).toLowerCase()) >= 0);
+      if (!p) return console.warn('[vm] no player called "' + who + '"');
+      const key = slug(AGENTS[p.agent]);
+      if (!ULT_ZONES[key]) return console.warn('[vm] ' + p.name + ' is ' + (AGENTS[p.agent] || 'IG ' + p.agent) + ' - no area ult defined for that agent. Defined: ' + Object.keys(ULT_ZONES).join(', '));
+      if (!POS[p.name] || POS[p.name].x == null) return console.warn('[vm] no position known for ' + p.name + ' yet, so there is nowhere to put it');
+      return castZone(p, true) ? console.log('%c[vm] ' + ULT_ZONES[key].ability + ' placed at ' + p.name + "'s position", 'color:#ffd75e;font-weight:bold') : console.warn('[vm] already placed this round');
+    },
+    // tune the circle: vm.zone('killjoy', 11) sets the radius as a % of the map
+    zone: (agent, opts) => {
+      const k = slug(agent), z = ULT_ZONES[k];
+      if (!z) return console.table(ULT_ZONES);
+      // a number is the radius; an object can also retune the timings if Riot ever changes them
+      if (typeof opts === 'number') { z.radiusPct = opts; paint(true); }
+      else if (opts && typeof opts === 'object') { Object.assign(z, opts); paint(true); }
+      console.log('[vm] ' + z.ability + ': radius ' + z.radiusPct + '% of the map, ' + z.windup + 's windup + ' + z.active + 's active');
+      return z;
+    },
     ults: () => {
       const st = LAST; if (!st) return console.warn('[vm] no live match');
       const F = GAME.f;
