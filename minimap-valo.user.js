@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Valorant Minimap
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      2.0.0
+// @version      2.1.0
 // @description  minimap
 // @match        https://*.bet365.com/*
 // @include      /^https?:\/\/[^/]*\bbet365\.[a-z.]+\//
@@ -778,8 +778,8 @@
       <div class="row">${chk('showNames', 'Names')}${chk('showWeapons', 'Weapon')}${chk('showHp', 'Health')}${chk('showShield', 'Shield')}${chk('showUlt', 'Ult ⚡')}${chk('showUltUsed', 'Ult used')}${chk('ultFx', 'Viper haze')}${chk('showDefusing', 'Defusing?')}${chk('showTrails', 'Trails')}${chk('showDead', 'Dead')}${chk('dimStale', 'Dim stale pos')}</div>
       <div class="row"><label>Icon</label><input type="range" id="vmSz" min="16" max="60" value="${CFG.size}"><span id="vmSzV">${CFG.size}px</span>
         <label>Map</label><input type="range" id="vmOp" min="0" max="100" value="${Math.round(CFG.mapOp * 100)}"><span id="vmOpV">${Math.round(CFG.mapOp * 100)}%</span></div>
-      <div class="hd">Orientation${sl ? ' - ' + esc(sl) : ' (no map detected)'}</div>
-      ${st && !st.mapFromFeed ? `<div class="row"><label>Feed sent no map name - set it</label><select id="vmMapSel"><option value="">(none)</option>${Object.keys(GAMES).map(g => GAMES[g].maps.map(m => `<option ${slug(CFG.mapOverride) === slug(m) ? 'selected' : ''}>${m}</option>`).join('')).join('')}</select></div>` : ''}
+      <div class="hd">Orientation${sl ? ' - ' + esc(sl) : (st && st.map ? ' - no layout stored for ' + esc(st.map) : ' - no map name in the feed')}</div>
+      ${st && !st.mapFromFeed ? `<div class="row"><label>${st.map ? 'Map set by hand' : 'Feed sent no map name - set it'}</label><select id="vmMapSel"><option value="">(none)</option>${Object.keys(GAMES).map(g => GAMES[g].maps.map(m => `<option ${slug(CFG.mapOverride) === slug(m) ? 'selected' : ''}>${m}</option>`).join('')).join('')}</select></div>` : ''}
       <div class="row">
         <button class="vbtn ${o.fx ? 'on' : ''}" data-o="fx">Flip X</button>
         <button class="vbtn ${o.fy ? 'on' : ''}" data-o="fy">Flip Y</button>
@@ -1003,7 +1003,7 @@
     STAT.textContent = txt; STAT.className = cls;
 
     const withPos = st.players.filter(p => POS[p.name] && POS[p.name].x != null).length;
-    P.querySelector('#vmmInfo').textContent = `${withPos}/${st.players.length} with position - ${frames} frames${sl ? '' : (st.mapFromFeed ? ' - no layout for ' + mapN : ' - feed sent no map name (\u2699 to set it)')}${DATA_OK ? '' : ' - CSP blocks data:'}${OBJ.src ? ' - ' + OBJ.src : ''}`;
+    P.querySelector('#vmmInfo').textContent = `${withPos}/${st.players.length} with position - ${frames} frames${sl ? '' : (st.map ? ' - no layout stored for ' + mapN + ' (vm.layout)' : ' - no map name in feed (\u2699 to set it)')}${DATA_OK ? '' : ' - CSP blocks data:'}${OBJ.src ? ' - ' + OBJ.src : ''}`;
     tock(_t0);
   }
   // a paint should cost a millisecond or two; if it ever doesn't, say so, instead of just
