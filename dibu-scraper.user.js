@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.6.7
+// @version      1.8.0
 // @description  bb scraper
 // @icon         https://betboom.ru/favicon.ico
 // @author       GG
@@ -282,6 +282,8 @@
         mute: store('mute') === true,
         soundReady: false,
         lastResub: 0,
+        seriesSock: null, lastSeriesOpen: 0, seriesStatus: 'idle', seriesDelay: null,
+        logTab: 'cur',
         rx: { tree: 0, grid: 0, bad: 0, sockets: 0 },
     };
 
@@ -293,6 +295,7 @@
             stats: {}, roundHistory: {}, prevRounds: {},
             events: [], seenKills: new Set(),
             bombPlanted: false, lastUpdate: 0,
+            seriesId: null, seeded: {}, seriesStats: null,
         };
     }
 
@@ -660,6 +663,65 @@
         return { teams, known: false };
     }
 
+    // The feed's own round history: [{1:round, 2:winnerTeamId, 3:winnerSide,
+    // 4:reason}], complete from round 1 whenever we connect.
+    const FEED_REASON = {
+        opponent_eliminated: 'elim',
+        bomb_exploded: 'bomb',
+        bomb_defused: 'defuse',
+        time_expired: 'time',
+    };
+
+    function backfillRounds(g, m) {
+        if (!m || !m.history || !m.history.length) return;
+        const mn = m.num;
+        if (!g.roundHistory[mn]) g.roundHistory[mn] = [];
+        const hist = g.roundHistory[mn];
+        const home = g.teams[0];
+        const seeded = [];
+        let added = 0;
+
+        m.history.forEach(r => {
+            const roundNo = r[1];
+            const teamId = r[2];
+            const side = r[3];
+            if (!roundNo || !teamId || !side) return;
+            if (hist.some(x => x.round === roundNo)) return;
+
+            // homeSide anchors the half boundary in the strip. The feed only
+            // states the WINNER's side, so for a round the home team lost we
+            // take the other side — with two sides that is exact, not a guess.
+            let homeSide = null;
+            if (home) {
+                homeSide = String(teamId) === String(home.id)
+                    ? side
+                    : (side === 'terrorists' ? 'counter-terrorists' : 'terrorists');
+            }
+            const entry = {
+                round: roundNo, teamId: String(teamId), side, homeSide,
+                reason: FEED_REASON[r[4]] || 'time', fromFeed: true,
+            };
+            hist.push(entry);
+            seeded.push(entry);
+            added++;
+        });
+
+        if (added) {
+            hist.sort((a, b) => a.round - b.round);
+            // Rounds that predate the connection can be put in the log too: the
+            // feed states who won, on which side and how. Their kills cannot —
+            // the feed only ever carries the LAST kill, so there is no history
+            // to recover. They get no timestamp rather than a fabricated one.
+            seeded.sort((a, b) => a.round - b.round).forEach(e => {
+                const tName = (g.teams.find(t => t.id === e.teamId) || {}).name || e.teamId;
+                logEvent(g, 'round', `ROUND ${e.round} — ${tName} wins (${REASON[e.reason]})`,
+                    undefined, { side: e.side, teamId: e.teamId, mapNum: mn, noTime: true });
+            });
+            g.seeded[mn] = true;
+            S.dirty = true;
+        }
+    }
+
     function handleGrid(msg) {
         const payload = msg[4] || msg[5];
         if (!payload || typeof payload !== 'object') return;
@@ -679,6 +741,11 @@
 
         let g = S.games.get(matchId);
         if (!g) { g = newGame(matchId); S.games.set(matchId, g); }
+
+        // payload[2] is GRID's own series id, sitting next to the betboom match
+        // id in every frame and ignored until now. It is the key to the widget
+        // feed, so no iframe scraping or URL guessing is needed to find it.
+        if (payload[2]) g.seriesId = String(payload[2]);
         // Never let a frame for some other match steal the selection. Before
         // this, a prematch pick with no feed yet would be silently replaced by
         // whatever match the page happened to be subscribed to, and the
@@ -706,6 +773,7 @@
             return {
                 uuid: m[1], num: m[2], name: m[3],
                 minimap: m[4], live: m[5] === 1, photo: m[7], sides,
+                history: arr(m[8]),
             };
         }).sort((a, b) => a.num - b.num);
 
@@ -801,7 +869,8 @@
                             homeSide, reason,
                         });
                         const tName = (g.teams.find(t => t.id === tid) || {}).name || tid;
-                        logEvent(g, 'round', `ROUND ${roundNo} — ${tName} wins (${REASON[reason]})`);
+                        logEvent(g, 'round', `ROUND ${roundNo} — ${tName} wins (${REASON[reason]})`,
+                            undefined, { side: liveMap.sides[tid].side, teamId: tid, mapNum: mn });
                         if (isActive) play('roundEnd');
                     }
                     g.lastSpecial = null;
@@ -812,6 +881,14 @@
             g.roundHistory[mn].sort((a, b) => a.round - b.round);
             void sumBefore;
         }
+
+        // Rounds played BEFORE we connected. The feed carries the whole history
+        // per map in m[8] and we were rebuilding it from score deltas instead,
+        // which can only ever see rounds that happen while we are watching.
+        // Runs after the delta block on purpose: a round that ends live is
+        // logged and sounded by that block first, and only what is still
+        // missing gets filled in here, silently.
+        g.maps.forEach(m => backfillRounds(g, m));
 
         const kill = gs[5];
         if (kill && kill[6] && !g.seenKills.has(kill[6])) {
@@ -929,9 +1006,20 @@
         else if (k.idx === 1) play('killAway');
     }
 
-    function logEvent(g, type, text, teamIdx) {
-        g.events.push({ type, text, t: new Date(), teamIdx });
-        if (g.events.length > 300) g.events.shift();
+    // meta carries what the renderer needs but the text should not spell out:
+    // which map the event belongs to (so the log can be split per map), the
+    // side that won a round (so it can be coloured by side rather than all in
+    // one colour), and the team (so a crest can be shown).
+    function logEvent(g, type, text, teamIdx, meta) {
+        meta = meta || {};
+        g.events.push({
+            type, text, teamIdx,
+            t: meta.noTime ? null : new Date(),
+            mapNum: meta.mapNum !== undefined ? meta.mapNum : g.liveMapNum,
+            side: meta.side || null,
+            teamId: meta.teamId !== undefined ? meta.teamId : null,
+        });
+        if (g.events.length > 400) g.events.shift();
     }
 
     // =====================================================================
@@ -1042,6 +1130,139 @@
         S.lastOwnOpen = Date.now();
         try { S.ownSocket = new HookedWS(S.gridUrl); }
         catch (e) { S.ownSocket = null; }
+    }
+
+    // ---------- GRID series scoreboard ----------
+    // The per-map stats below are counted from kills seen since load, so a map
+    // joined late reads 0/0/0 forever. GRID publishes cumulative K/D/A on its
+    // own widget socket, keyed by the series id the main feed already hands us.
+    // A WebSocket is not subject to CORS, so the page can open this directly;
+    // the subscription lives entirely in the URL and nothing is ever sent.
+    //
+    // These numbers are SERIES totals, not per map, and they carry the same ~8s
+    // integrity delay as everything else. They are shown as a separate column
+    // for exactly that reason — merging them into the per-map column would
+    // quietly mix two different things.
+    const GRID_SB_HOST = 'wss://grid.sporthub.bet:445';
+    const GRID_SB_RETRY = 15000;
+
+    function gridScoreboardUrl(seriesId) {
+        return `${GRID_SB_HOST}/widgets-v2/live/${encodeURIComponent(seriesId)}` +
+            '?events=team_scoreboard&isCompressionEnabled=true';
+    }
+
+    function ensureSeriesSocket() {
+        const g = S.active ? S.games.get(S.active) : null;
+        const want = g && g.seriesId ? g.seriesId : null;
+        const sb = S.seriesSock;
+
+        // Only ever one, and only for the match on screen. We stay subscribed to
+        // every probed match on the main feed; doing that here would mean a
+        // socket per match for data nobody is looking at.
+        if (sb && sb.seriesId !== want) {
+            try { sb.ws.close(); } catch (e) { /* already gone */ }
+            S.seriesSock = null;
+            // Switching matches is deliberate, not a failed connection: clear
+            // the backoff or the new selection would sit blank for 15 seconds.
+            S.lastSeriesOpen = 0;
+            S.seriesStatus = 'idle';
+            S.seriesDelay = null;
+        }
+        if (!want) return;
+        if (S.seriesSock && (S.seriesSock.ws.readyState === 0 || S.seriesSock.ws.readyState === 1)) return;
+        if (Date.now() - S.lastSeriesOpen < GRID_SB_RETRY) return;
+        S.lastSeriesOpen = Date.now();
+
+        let ws;
+        try { ws = new OrigWS(gridScoreboardUrl(want)); }
+        catch (e) { S.seriesStatus = 'error'; return; }
+        // OrigWS, not HookedWS: these are JSON frames from another provider and
+        // routing them through the protobuf handler would only log decode noise.
+        S.seriesSock = { ws, seriesId: want };
+        S.seriesStatus = 'connecting';
+
+        ws.addEventListener('open', () => { S.seriesStatus = 'open'; S.dirty = true; });
+        // Only the CURRENT socket may touch the status: a socket closed because
+        // the user switched matches must not overwrite the state of the one
+        // that replaced it.
+        ws.addEventListener('close', () => {
+            if (!S.seriesSock || S.seriesSock.ws !== ws) return;
+            S.seriesSock = null;
+            S.seriesStatus = 'closed';
+            S.dirty = true;
+        });
+        ws.addEventListener('error', () => {
+            if (S.seriesSock && S.seriesSock.ws === ws) S.seriesStatus = 'error';
+        });
+        ws.addEventListener('message', ev => {
+            if (typeof ev.data !== 'string') return;
+            let env;
+            try { env = JSON.parse(ev.data); } catch (e) { return; }
+            if (!env || typeof env.service !== 'string' || !Array.isArray(env.data)) return;
+            if (env.service.indexOf('team_scoreboard') === -1) return;
+            if (typeof env.delay === 'number') S.seriesDelay = env.delay;
+            env.data.forEach(item => {
+                unpackGrid(item)
+                    .then(obj => applySeriesScoreboard(want, obj))
+                    .catch(() => {
+                        if (S.seriesSock && S.seriesSock.ws === ws) S.seriesStatus = 'unreadable';
+                    });
+            });
+        });
+    }
+
+    // Payloads arrive base64 over gzip. DecompressionStream is async, which is
+    // why this returns a promise rather than being inlined above.
+    function unpackGrid(item) {
+        if (!item || typeof item.data !== 'string') return Promise.reject(new Error('empty'));
+        let bytes;
+        try { bytes = Uint8Array.from(atob(item.data), c => c.charCodeAt(0)); }
+        catch (e) { return Promise.reject(e); }
+        if (!item.isCompressed) {
+            try { return Promise.resolve(JSON.parse(new TextDecoder().decode(bytes))); }
+            catch (e) { return Promise.reject(e); }
+        }
+        if (typeof DecompressionStream === 'undefined') return Promise.reject(new Error('no gzip'));
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+        return new Response(stream).arrayBuffer()
+            .then(b => JSON.parse(new TextDecoder().decode(new Uint8Array(b))));
+    }
+
+    const KDA_RE = /^\s*(\d+)\s*\/\s*(\d+)\s*\/\s*(\d+)\s*$/;
+
+    function kdaFrom(dataPoints) {
+        if (!Array.isArray(dataPoints)) return null;
+        for (const dp of dataPoints) {
+            if (!dp || typeof dp.value !== 'string') continue;
+            const key = (dp.labelTranslation && dp.labelTranslation.key) || dp.label || '';
+            if (String(key).toLowerCase().indexOf('kda') === -1 && dp.label !== 'K/D/A') continue;
+            const m = KDA_RE.exec(dp.value);
+            if (m) return { k: +m[1], d: +m[2], a: +m[3] };
+        }
+        return null;
+    }
+
+    function applySeriesScoreboard(seriesId, obj) {
+        if (!obj || !Array.isArray(obj.teams)) return;
+        const byNick = {};
+        const teams = [];
+        obj.teams.forEach(t => {
+            teams.push({ id: String(t.id), name: t.name, kda: kdaFrom(t.dataPoints) });
+            (t.players || []).forEach(p => {
+                const kda = kdaFrom(p.dataPoints);
+                // Joined on nickname, not id: the ids in this payload come
+                // through rounded (…53186000), so they do not survive a
+                // comparison with the real 17-digit steam ids on the main feed.
+                if (kda && p.name) byNick[String(p.name).toLowerCase()] = kda;
+            });
+        });
+        S.games.forEach(g => {
+            if (g.seriesId === seriesId) {
+                g.seriesStats = { byNick, teams, at: Date.now(), delay: S.seriesDelay };
+            }
+        });
+        S.seriesStatus = 'live';
+        S.dirty = true;
     }
 
     // Nothing in the tree feed says whether a match has GRID game-state
@@ -1335,7 +1556,13 @@
 .mh-ev.kill.home span{color:#8fc4ff}
 .mh-ev.kill.away span{color:#e5bd75}
 .mh-ev.bomb span{color:#ff8a5c;font-weight:600}
-.mh-ev.round span{color:#4a9eff;font-weight:600}
+.mh-ev.round span{color:#9fb2c9;font-weight:600}
+.mh-ev.round.T span{color:#e0a441}
+.mh-ev.round.CT span{color:#6bb0ff}
+.mh-evlogo{width:13px;height:13px;flex:none;object-fit:contain;border-radius:2px;
+  margin-top:1px}
+.mh-evlogo.ph{display:flex;align-items:center;justify-content:center;font-size:8px;
+  font-weight:700;color:#8ba0bb;background:#16233a;border-radius:2px}
 .mh-ev.suicide span{color:#c76b8a}
 .mh-ev.phase span{color:#8ba0bb}
 
@@ -1375,6 +1602,11 @@
 .mh-stn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#d3e0f0}
 .mh-stv{color:#93a7c1;flex:none;font-size:9.5px}
 .mh-stv.hs{color:#d4a340;min-width:24px;text-align:right}
+.mh-stv.ser{color:#6f86a8;min-width:52px;text-align:right}
+.mh-gs{margin-left:6px;font-size:8px;font-weight:700;letter-spacing:.4px;
+  padding:1px 4px;border-radius:2px}
+.mh-gs.on{background:#12331f;color:#5fd08a}
+.mh-gs.off{background:#2a2a2a;color:#77797d}
 .mh-wpn{background:#0a121f;border-bottom:1px solid #101b2c;max-height:108px;overflow-y:auto}
 .mh-wpn div{display:flex;justify-content:space-between;gap:5px;padding:2px 7px 2px 14px;
   font-size:9.5px;color:#8ba0bb}
@@ -1437,7 +1669,8 @@
             <div class="mh-card"><div class="mh-scroll mh-plist" id="mh-t2"></div></div>
           </div>
           <div class="mh-card mh-log">
-            <div class="mh-h"><span class="grow">Event log &amp; kill feed</span></div>
+            <div class="mh-h"><span class="grow">Event log &amp; kill feed</span>
+              <span id="mh-logtabs" style="display:flex;gap:3px"></span></div>
             <div class="mh-scroll" id="mh-log"></div>
           </div>
         </div>
@@ -1613,6 +1846,38 @@
     }
 
     // Only claim "Home/Away" when the odds feed actually confirmed the mapping.
+    // Team crest for the log. The tree feed already carries it (match node
+    // 16.1.7 / 16.3.7) and the scraper was already storing it; it was simply
+    // never drawn. Resolved by NAME first because g.teams order only matches
+    // the tree's home/away when orderKnown is true — indexing blindly would
+    // put the wrong crest on every line of a match we could not align.
+    function teamCrest(g, idx, teamId) {
+        if (!g) return '';
+        const rec = S.matches.get(String(g.matchId));
+        if (!rec || !rec.home || !rec.away) return '';
+        let team = null;
+        if (teamId !== null && teamId !== undefined) team = g.teams.find(t => String(t.id) === String(teamId));
+        if (!team && idx >= 0) team = g.teams[idx];
+        if (team) {
+            const n = normName(team.name);
+            if (n === normName(rec.home.name) || n === normName(rec.home.short)) return rec.home.logo || '';
+            if (n === normName(rec.away.name) || n === normName(rec.away.short)) return rec.away.logo || '';
+        }
+        if (!g.orderKnown) return '';          // no name match and no trusted order
+        if (idx === 0) return rec.home.logo || '';
+        if (idx === 1) return rec.away.logo || '';
+        return '';
+    }
+
+    function eventTeamIdx(g, e) {
+        if (e.teamIdx === 0 || e.teamIdx === 1) return e.teamIdx;
+        if (e.teamId !== null && e.teamId !== undefined) {
+            const i = g.teams.findIndex(t => String(t.id) === String(e.teamId));
+            if (i >= 0) return i;
+        }
+        return -1;
+    }
+
     function sideLabel(g, idx) {
         if (g && g.orderKnown) return idx === 0 ? 'Home' : 'Away';
         return idx === 0 ? 'Team 1' : 'Team 2';
@@ -1947,15 +2212,73 @@
     // ---------- log ----------
     function renderLog(g) {
         const box = root.querySelector('#mh-log');
+        const tabs = root.querySelector('#mh-logtabs');
         const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
         box.textContent = '';
-        if (!g || !g.events.length) { box.appendChild(el('div', 'mh-empty', 'No events yet.')); return; }
-        g.events.slice(-120).forEach(e => {
-            const side = e.teamIdx === 0 ? ' home' : (e.teamIdx === 1 ? ' away' : '');
-            const row = el('div', 'mh-ev ' + e.type + side);
+        tabs.textContent = '';
+        if (!g) { box.appendChild(el('div', 'mh-empty', 'No events yet.')); return; }
+
+        // "Current" follows whichever map the rest of the panel is showing, so
+        // clicking a map tab moves the whole panel together instead of leaving
+        // the log describing a different map than the scoreboard above it.
+        const m = activeMap(g);
+        const curNum = m ? m.num : g.liveMapNum;
+        const cur = [], past = [];
+        g.events.forEach(e => {
+            (e.mapNum === null || e.mapNum === undefined || e.mapNum === curNum ? cur : past).push(e);
+        });
+
+        [['cur', 'Current map', cur], ['past', 'Past logs', past]].forEach(([key, label, list]) => {
+            const b = el('button', 'mh-sc' + (S.logTab === key ? ' on' : ''),
+                `${label}${list.length ? ' ' + list.length : ''}`);
+            b.title = key === 'cur'
+                ? `Events on ${m ? m.name || ('map ' + curNum) : 'the current map'}`
+                : 'Everything captured on the other maps of this match';
+            b.addEventListener('click', ev => {
+                ev.stopPropagation();
+                S.logTab = key;
+                render();
+            });
+            tabs.appendChild(b);
+        });
+
+        const shown = S.logTab === 'past' ? past : cur;
+        if (!shown.length) {
+            box.appendChild(el('div', 'mh-empty', S.logTab === 'past'
+                ? 'Nothing from earlier maps.'
+                : 'No events yet.'));
+            return;
+        }
+
+        shown.slice(-200).forEach(e => {
+            const idx = eventTeamIdx(g, e);
+            const who = idx === 0 ? ' home' : (idx === 1 ? ' away' : '');
+            // A round line is coloured by the SIDE that won it, not by whether
+            // the team is home or away: on the strip and in the scoreboard the
+            // eye is already tracking T vs CT, and two teams sharing one colour
+            // made the winner unreadable at a glance.
+            const sd = e.side && SIDE[e.side] ? ' ' + SIDE[e.side] : '';
+            const row = el('div', 'mh-ev ' + e.type + who + sd);
+
             const t = document.createElement('time');
-            t.textContent = hhmmss(e.t);
+            t.textContent = e.t ? hhmmss(e.t) : '—';
+            if (!e.t) t.title = 'Played before the scraper connected — the feed gives the ' +
+                'round result but not the time it happened';
             row.appendChild(t);
+
+            const crest = teamCrest(g, idx, e.teamId);
+            if (crest) {
+                const img = document.createElement('img');
+                img.className = 'mh-evlogo';
+                img.src = crest;
+                img.loading = 'lazy';
+                img.addEventListener('error', () => img.remove());
+                row.appendChild(img);
+            } else if (idx >= 0 && g.teams[idx]) {
+                const ph = el('div', 'mh-evlogo ph', (g.teams[idx].name || '?').slice(0, 1));
+                row.appendChild(ph);
+            }
+
             row.appendChild(el('span', '', e.text));
             box.appendChild(row);
         });
@@ -1970,7 +2293,7 @@
         const m = activeMap(g);
         if (!m) return;
         const hist = g.roundHistory[m.num] || [];
-        if (!hist.length) { box.appendChild(el('div', 'mh-empty', 'Fills up from connect.')); return; }
+        if (!hist.length) { box.appendChild(el('div', 'mh-empty', 'No rounds played yet.')); return; }
 
         // Left gutter: which side each team is on right now.
         const gutter = el('div', 'mh-rhg');
@@ -2001,7 +2324,8 @@
                     cell.appendChild(holder.firstChild);
                     cell.title = `Round ${r.round} · ` +
                         `${(g.teams.find(t => t.id === r.teamId) || {}).name || ''} (${s})` +
-                        ` · ${REASON[r.reason] || 'win'}`;
+                        ` · ${REASON[r.reason] || 'win'}` +
+                        (r.fromFeed ? ' · from feed history' : '');
                 }
                 grid.appendChild(cell);
             });
@@ -2152,17 +2476,30 @@
         box.textContent = '';
         const t = g && g.teams[idx];
         head.textContent = t ? `${sideLabel(g, idx)} · ${t.name}` : sideLabel(g, idx);
+        if (idx === 0) {
+            const dot = el('span', 'mh-gs ' + (S.seriesStatus === 'live' ? 'on' : 'off'), 'GRID');
+            dot.title = 'GRID series scoreboard: ' + S.seriesStatus +
+                (S.seriesDelay !== null ? ` · declares ~${S.seriesDelay}s delay` : '') +
+                '\nSupplies cumulative series K/D/A, including rounds played before connect.';
+            head.appendChild(dot);
+        }
         if (!t) return;
 
         const m = activeMap(g);
         const mn = m ? m.num : g.liveMapNum;
         const table = g.stats[mn] || {};
 
-        const rows = activePlayers(g, t).map(p => ({ p, st: table[p.steam] || EMPTY_STAT }));
+        const ser = g.seriesStats;
+        const rows = activePlayers(g, t).map(p => ({
+            p, st: table[p.steam] || EMPTY_STAT,
+            ser: ser ? ser.byNick[String(p.nick).toLowerCase()] : null,
+        }));
         const played = m ? Object.values(m.sides).reduce((a, s) => a + s.rounds, 0) : 0;
         const recorded = rows.reduce((a, r) => a + r.st.k, 0);
         if (played > 0 && recorded === 0) {
-            box.appendChild(el('div', 'mh-empty', 'Map ended before connect. Stats count live only.'));
+            box.appendChild(el('div', 'mh-empty', ser
+                ? 'Map joined late — first column counts live only, series column is from the feed.'
+                : 'Map ended before connect. Stats count live only.'));
         }
 
         rows.sort((a, b) => b.st.k - a.st.k);
@@ -2172,7 +2509,12 @@
             row.appendChild(el('div', 'mh-stn', r.p.nick));
             row.appendChild(el('div', 'mh-stv', `${r.st.k}/${r.st.d}/${r.st.a}`));
             row.appendChild(el('div', 'mh-stv hs', `${r.st.hs}hs`));
-            row.title = `1st half ${r.st.h1} · 2nd half ${r.st.h2} · OT ${r.st.ot}`;
+            if (r.ser) row.appendChild(el('div', 'mh-stv ser', `${r.ser.k}/${r.ser.d}/${r.ser.a}`));
+            row.title = `Map, counted live: ${r.st.k}/${r.st.d}/${r.st.a}` +
+                ` · 1st half ${r.st.h1} · 2nd half ${r.st.h2} · OT ${r.st.ot}` +
+                (r.ser ? `\nSeries, from the GRID feed: ${r.ser.k}/${r.ser.d}/${r.ser.a}` +
+                    ` (whole series, not this map` +
+                    (S.seriesDelay !== null ? `, ~${S.seriesDelay}s behind` : '') + ')' : '');
             row.addEventListener('click', () => {
                 S.expandedPlayer = open ? null : r.p.steam;
                 render();
@@ -2185,6 +2527,13 @@
                 halves.innerHTML = `<span>Kills per half</span>` +
                     `<i>1st ${r.st.h1} · 2nd ${r.st.h2} · OT ${r.st.ot}</i>`;
                 panel.appendChild(halves);
+
+                if (r.ser) {
+                    const sd = el('div');
+                    sd.innerHTML = '<span>Series K/D/A (GRID feed)</span>' +
+                        `<i>${r.ser.k}/${r.ser.d}/${r.ser.a}</i>`;
+                    panel.appendChild(sd);
+                }
 
                 const ws = Object.entries(r.st.weapons).sort((a, b) => b[1].k - a[1].k);
                 if (!ws.length) {
@@ -2327,6 +2676,7 @@
 
         setInterval(() => { if (S.open && S.dirty) { S.dirty = false; render(); } }, 350);
         setInterval(watchdog, 5000);
+        setInterval(ensureSeriesSocket, 3000);
         setInterval(probeMatches, 700);
         checkClock();
         setInterval(checkClock, 600000);
