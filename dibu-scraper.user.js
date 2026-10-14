@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.8.0
+// @version      1.9.0
 // @description  bb scraper
 // @icon         https://betboom.ru/favicon.ico
 // @author       GG
 // @match        https://betboom.ru/esport/*
+// @match        https://betboom.ru/sport/*
 // @run-at       document-start
 // @grant        none
 // @updateURL    https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/dibu-scraper.user.js
@@ -284,6 +285,7 @@
         lastResub: 0,
         seriesSock: null, lastSeriesOpen: 0, seriesStatus: 'idle', seriesDelay: null,
         logTab: 'cur',
+        flip: store('flip') || {},
         rx: { tree: 0, grid: 0, bad: 0, sockets: 0 },
     };
 
@@ -1559,6 +1561,8 @@
 .mh-ev.round span{color:#9fb2c9;font-weight:600}
 .mh-ev.round.T span{color:#e0a441}
 .mh-ev.round.CT span{color:#6bb0ff}
+.mh-headlogo{width:12px;height:12px;object-fit:contain;vertical-align:-2px;
+  margin-right:4px;border-radius:2px}
 .mh-evlogo{width:13px;height:13px;flex:none;object-fit:contain;border-radius:2px;
   margin-top:1px}
 .mh-evlogo.ph{display:flex;align-items:center;justify-content:center;font-size:8px;
@@ -1848,25 +1852,16 @@
     // Only claim "Home/Away" when the odds feed actually confirmed the mapping.
     // Team crest for the log. The tree feed already carries it (match node
     // 16.1.7 / 16.3.7) and the scraper was already storing it; it was simply
-    // never drawn. Resolved by NAME first because g.teams order only matches
-    // the tree's home/away when orderKnown is true — indexing blindly would
-    // put the wrong crest on every line of a match we could not align.
+    // never drawn here. Resolution is delegated to logoFor, which matches by
+    // NAME first — g.teams order only lines up with the tree's home/away when
+    // orderKnown is true, so indexing blindly would put the wrong crest on
+    // every line of a match we could not align.
     function teamCrest(g, idx, teamId) {
         if (!g) return '';
-        const rec = S.matches.get(String(g.matchId));
-        if (!rec || !rec.home || !rec.away) return '';
         let team = null;
         if (teamId !== null && teamId !== undefined) team = g.teams.find(t => String(t.id) === String(teamId));
         if (!team && idx >= 0) team = g.teams[idx];
-        if (team) {
-            const n = normName(team.name);
-            if (n === normName(rec.home.name) || n === normName(rec.home.short)) return rec.home.logo || '';
-            if (n === normName(rec.away.name) || n === normName(rec.away.short)) return rec.away.logo || '';
-        }
-        if (!g.orderKnown) return '';          // no name match and no trusted order
-        if (idx === 0) return rec.home.logo || '';
-        if (idx === 1) return rec.away.logo || '';
-        return '';
+        return team ? logoFor(g, team) : '';
     }
 
     function eventTeamIdx(g, e) {
@@ -1876,6 +1871,24 @@
             if (i >= 0) return i;
         }
         return -1;
+    }
+
+    // Which team is drawn on which SIDE OF THE PANEL. Everything else keeps
+    // indexing teams by their real home/away position, because home/away is a
+    // fact about the match and the odds feed depends on it — this only mirrors
+    // the layout. Per match, not global: wanting one team on the left says
+    // nothing about the next match.
+    function dispOrder(g) {
+        return (g && S.flip[g.matchId]) ? [1, 0] : [0, 1];
+    }
+    const isFlipped = g => !!(g && S.flip[g.matchId]);
+
+    function toggleFlip(g) {
+        if (!g) return;
+        if (S.flip[g.matchId]) delete S.flip[g.matchId];
+        else S.flip[g.matchId] = 1;
+        store('flip', S.flip);
+        render();
     }
 
     function sideLabel(g, idx) {
@@ -2030,15 +2043,19 @@
         box.textContent = '';
         if (!g || !g.teams.length) { box.appendChild(el('div', 'mh-empty', 'No match selected.')); return; }
 
-        [0, 1].forEach(i => {
-            if (i === 1) {
+        box.title = 'Double-click to swap sides';
+        box.ondblclick = () => toggleFlip(g);
+
+        const ord = dispOrder(g);
+        ord.forEach((i, slot) => {
+            if (slot === 1) {
                 const ss = seriesScore(g);
-                const sc = el('div', 'mh-series', `${ss[0]} - ${ss[1]}`);
-                sc.title = 'Maps won';
+                const sc = el('div', 'mh-series', `${ss[ord[0]]} - ${ss[ord[1]]}`);
+                sc.title = 'Maps won · double-click to swap sides';
                 box.appendChild(sc);
             }
             const t = g.teams[i];
-            const wrap = el('div', 'mh-team' + (i === 1 ? ' away' : ''));
+            const wrap = el('div', 'mh-team' + (slot === 1 ? ' away' : ''));
             const logo = logoFor(g, t);
             if (logo) {
                 const img = document.createElement('img');
@@ -2228,9 +2245,8 @@
             (e.mapNum === null || e.mapNum === undefined || e.mapNum === curNum ? cur : past).push(e);
         });
 
-        [['cur', 'Current map', cur], ['past', 'Past logs', past]].forEach(([key, label, list]) => {
-            const b = el('button', 'mh-sc' + (S.logTab === key ? ' on' : ''),
-                `${label}${list.length ? ' ' + list.length : ''}`);
+        [['cur', 'Current map', cur], ['past', 'Past logs', past]].forEach(([key, label]) => {
+            const b = el('button', 'mh-sc' + (S.logTab === key ? ' on' : ''), label);
             b.title = key === 'cur'
                 ? `Events on ${m ? m.name || ('map ' + curNum) : 'the current map'}`
                 : 'Everything captured on the other maps of this match';
@@ -2288,6 +2304,13 @@
     // ---------- round history ----------
     function renderBars(g) {
         const box = root.querySelector('#mh-bars');
+        // The strip is rebuilt on every repaint, and it used to jump to the
+        // newest round each time — so scrolling back to look at an early round
+        // was undone within a second. Remember where the user was and only
+        // follow the live edge if they were already sitting on it.
+        const old = box.querySelector('.mh-rhscroll');
+        const prevLeft = old ? old.scrollLeft : null;
+        const wasAtEnd = old ? (old.scrollLeft + old.clientWidth >= old.scrollWidth - 8) : true;
         box.textContent = '';
         if (!g) return;
         const m = activeMap(g);
@@ -2297,7 +2320,8 @@
 
         // Left gutter: which side each team is on right now.
         const gutter = el('div', 'mh-rhg');
-        [0, 1].forEach(i => {
+        const ord = dispOrder(g);
+        ord.forEach(i => {
             const s = sideOf(g, g.teams[i]);
             const cell = el('div', 'mh-rhs ' + (s || 'none'), s || '—');
             cell.title = `${sideLabel(g, i)} · ${(g.teams[i] || {}).name || ''}`;
@@ -2307,10 +2331,10 @@
 
         const scroll = el('div', 'mh-rhscroll');
         const grid = el('div', 'mh-rhgrid');
-        const t1 = g.teams[0];
+        const topTeam = g.teams[ord[0]];
 
         hist.forEach((r, i) => {
-            const winnerRow = (t1 && r.teamId === t1.id) ? 0 : 1;
+            const winnerRow = (topTeam && r.teamId === topTeam.id) ? 0 : 1;
             // Data-driven half boundary, so overtime splits work too.
             const half = i > 0 && r.homeSide && hist[i - 1].homeSide &&
                 hist[i - 1].homeSide !== r.homeSide;
@@ -2333,7 +2357,8 @@
 
         scroll.appendChild(grid);
         box.appendChild(scroll);
-        scroll.scrollLeft = scroll.scrollWidth;   // keep the latest round in view
+        if (wasAtEnd || prevLeft === null) scroll.scrollLeft = scroll.scrollWidth;
+        else scroll.scrollLeft = prevLeft;
     }
 
     // ---------- win probability ----------
@@ -2397,7 +2422,12 @@
         const e = S.odds.get(g.matchId).scopes[S.wpScope];
         const h = e.history.slice(-120);
         const w = 200, ht = 30;
-        const pts = h.map((d, i) => `${(i / Math.max(1, h.length - 1)) * w},${(1 - d.p) * ht}`).join(' ');
+        // p is the HOME win probability. Mirrored, the left-hand team is the
+        // away team, so the curve has to plot its probability instead — leaving
+        // it as it was would draw a line that means the opposite of its labels.
+        const fl = isFlipped(g);
+        const pv = d => (fl ? 1 - d.p : d.p);
+        const pts = h.map((d, i) => `${(i / Math.max(1, h.length - 1)) * w},${(1 - pv(d)) * ht}`).join(' ');
         const holder = document.createElement('div');
         holder.innerHTML = `<svg viewBox="0 0 ${w} ${ht}" preserveAspectRatio="none">` +
             `<line x1="0" y1="${ht / 2}" x2="${w}" y2="${ht / 2}" stroke="#1e2e46" stroke-width="1"/>` +
@@ -2413,11 +2443,13 @@
             b.textContent = txt;
             return b;
         };
+        const ordw = dispOrder(g);
+        const pct = i => ((i === 0 ? last.p : 1 - last.p) * 100).toFixed(0);
         const lbl = el('div', 'mh-wplbl');
         const l = el('span');
-        l.appendChild(mk(`${sideLabelShort(g, 0)} ${(last.p * 100).toFixed(0)}%`, g.teams[0]));
+        l.appendChild(mk(`${sideLabelShort(g, ordw[0])} ${pct(ordw[0])}%`, g.teams[ordw[0]]));
         const r = el('span');
-        r.appendChild(mk(`${((1 - last.p) * 100).toFixed(0)}% ${sideLabelShort(g, 1)}`, g.teams[1]));
+        r.appendChild(mk(`${pct(ordw[1])}% ${sideLabelShort(g, ordw[1])}`, g.teams[ordw[1]]));
         lbl.appendChild(l); lbl.appendChild(r);
         lbl.title = `${(g.teams[0] || {}).name} ${last.o1} · ${last.o2} ${(g.teams[1] || {}).name}`;
         box.appendChild(lbl);
@@ -2441,9 +2473,11 @@
 
         const rows = e.history.slice().reverse();
         const head = el('div', 'mh-ol head');
+        const og = gameOf();
+        const oord = dispOrder(og);
         head.innerHTML = '<time>time</time>' +
-            `<span>${sideLabelShort(gameOf(), 0).toLowerCase()}</span>` +
-            `<span>${sideLabelShort(gameOf(), 1).toLowerCase()}</span>`;
+            `<span>${sideLabelShort(og, oord[0]).toLowerCase()}</span>` +
+            `<span>${sideLabelShort(og, oord[1]).toLowerCase()}</span>`;
         log.appendChild(head);
 
         rows.forEach((d, i) => {
@@ -2462,8 +2496,15 @@
                 s.textContent = val.toFixed(2) + mark;
                 return s;
             };
-            row.appendChild(cell(d.o1, prev && prev.o1));
-            row.appendChild(cell(d.o2, prev && prev.o2));
+            // Columns follow the mirrored layout too, so a price always sits
+            // under the team it belongs to.
+            if (oord[0] === 0) {
+                row.appendChild(cell(d.o1, prev && prev.o1));
+                row.appendChild(cell(d.o2, prev && prev.o2));
+            } else {
+                row.appendChild(cell(d.o2, prev && prev.o2));
+                row.appendChild(cell(d.o1, prev && prev.o1));
+            }
             row.title = `Home ${(d.p * 100).toFixed(1)}% · Away ${((1 - d.p) * 100).toFixed(1)}%`;
             log.appendChild(row);
         });
@@ -2476,6 +2517,16 @@
         box.textContent = '';
         const t = g && g.teams[idx];
         head.textContent = t ? `${sideLabel(g, idx)} · ${t.name}` : sideLabel(g, idx);
+        const crest = t ? logoFor(g, t) : '';
+        if (crest) {
+            const img = document.createElement('img');
+            img.className = 'mh-headlogo';
+            img.src = crest;
+            img.alt = '';
+            img.referrerPolicy = 'no-referrer';
+            img.addEventListener('error', () => img.remove());
+            head.insertBefore(img, head.firstChild);
+        }
         if (idx === 0) {
             const dot = el('span', 'mh-gs ' + (S.seriesStatus === 'live' ? 'on' : 'off'), 'GRID');
             dot.title = 'GRID series scoreboard: ' + S.seriesStatus +
@@ -2652,14 +2703,15 @@
         renderStrip(g);
         renderMaps(g);
         renderCentre(g);
-        renderRoster(g, 0, '#mh-t1');
-        renderRoster(g, 1, '#mh-t2');
+        const ord = dispOrder(g);
+        renderRoster(g, ord[0], '#mh-t1');
+        renderRoster(g, ord[1], '#mh-t2');
         renderLog(g);
         if (!root.classList.contains('mh-nor')) {
             renderBars(g);
             renderWinProb(g);
-            renderTeamStats(g, 0, '#mh-sh1', '#mh-s1');
-            renderTeamStats(g, 1, '#mh-sh2', '#mh-s2');
+            renderTeamStats(g, ord[0], '#mh-sh1', '#mh-s1');
+            renderTeamStats(g, ord[1], '#mh-sh2', '#mh-s2');
         }
     }
 
@@ -2671,8 +2723,31 @@
         if (root) return;             // idempotent: never build a second panel
         buildShell();
 
-        const m = location.pathname.match(/\/(\d+)\/?$/);
-        if (m && !S.active) { S.active = m[1]; S.activePinned = true; }
+        // Both /esport/<sport>/<tournament>/<match> and
+        // /sport/esports/<n>/<tournament>/<match> end in the match id, so one
+        // pattern covers every route the site uses for the same event.
+        const matchIdFromUrl = () => {
+            const m = location.pathname.match(/\/(\d+)\/?$/);
+            return m ? m[1] : null;
+        };
+
+        const first = matchIdFromUrl();
+        if (first && !S.active) { S.active = first; S.activePinned = true; }
+
+        // The site is a single page app: moving to another match rewrites the
+        // URL without reloading, so reading it once at boot left the panel
+        // pinned to whatever match happened to be open first.
+        let lastPath = location.pathname;
+        setInterval(() => {
+            if (location.pathname === lastPath) return;
+            lastPath = location.pathname;
+            const id = matchIdFromUrl();
+            if (!id || id === S.active) return;
+            S.active = id;
+            S.activePinned = true;
+            S.selectedMapNum = null;
+            S.dirty = true;
+        }, 1000);
 
         setInterval(() => { if (S.open && S.dirty) { S.dirty = false; render(); } }, 350);
         setInterval(watchdog, 5000);
