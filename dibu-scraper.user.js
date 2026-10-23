@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.10.0
+// @version      1.11.3
 // @description  bb scraper
-// @icon         https://www.google.com/s2/favicons?sz=64&domain=oddin.gg
+// @icon         https://betboom.ru/favicon.ico
 // @author       GG
 // @match        https://betboom.ru/esport/*
 // @match        https://betboom.ru/sport/*
@@ -297,6 +297,8 @@
             stats: {}, roundHistory: {}, prevRounds: {},
             events: [], seenKills: new Set(),
             bombPlanted: false, lastUpdate: 0,
+            // Death audit: who dropped to 0, and whether a kill explains it.
+            prevAlive: {}, killedAt: {}, pendingDeaths: [], unexplained: [], auditRound: null,
             seriesId: null, seeded: {}, seriesStats: null,
         };
     }
@@ -601,11 +603,9 @@
     function logoFor(g, team) {
         const m = S.matches.get(g.matchId);
         if (!m || !team) return '';
-        const want = String(team.name || '').toLowerCase();
-        for (const c of [m.home, m.away]) {
-            if (!c) continue;
-            if (String(c.name).toLowerCase() === want || String(c.short).toLowerCase() === want) return c.logo;
-        }
+        const sh = compScore(team, m.home), sa = compScore(team, m.away);
+        if (sh > sa) return m.home.logo || '';
+        if (sa > sh) return m.away.logo || '';
         if (!g.orderKnown) return '';
         const idx = g.teams.indexOf(team);
         const c = idx === 0 ? m.home : (idx === 1 ? m.away : null);
@@ -646,17 +646,34 @@
     // cannot verify the mapping.
     const normName = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
+    // The odds tree and the game feed do not always spell a team the same
+    // way: "Team Brute" vs "BRUTE", "BakS eSports" vs "BAKS". Exact matching
+    // missed those, so the logos (and the home/away order) were lost. Score:
+    // 2 = exact, 1 = equal once filler words are dropped or one contains the
+    // other (4+ chars), 0 = no match. Callers only accept a unique assignment.
+    const FILLER = /\b(team|esports?|e-sports?|gaming|club|clan|academy)\b/gi;
+    function nameScore(a, b) {
+        const x = normName(a), y = normName(b);
+        if (!x || !y) return 0;
+        if (x === y) return 2;
+        const xs = normName(String(a).replace(FILLER, '')), ys = normName(String(b).replace(FILLER, ''));
+        if (xs && ys && xs === ys) return 1;
+        if (x.length >= 4 && y.length >= 4 && (x.indexOf(y) >= 0 || y.indexOf(x) >= 0)) return 1;
+        return 0;
+    }
+    function compScore(team, c) {
+        if (!team || !c) return 0;
+        return Math.max(nameScore(team.name, c.name), nameScore(team.name, c.short));
+    }
+
     function orderTeams(matchId, teams) {
         if (teams.length !== 2) return { teams, known: false };
         const meta = S.matches.get(matchId);
         if (meta && meta.home && meta.away) {
-            const homeKeys = [normName(meta.home.name), normName(meta.home.short)];
-            const awayKeys = [normName(meta.away.name), normName(meta.away.short)];
-            const a = normName(teams[0].name), b = normName(teams[1].name);
-            const aHome = homeKeys.indexOf(a) >= 0, bHome = homeKeys.indexOf(b) >= 0;
-            const aAway = awayKeys.indexOf(a) >= 0, bAway = awayKeys.indexOf(b) >= 0;
-            if ((aHome && !bHome) || (bAway && !aAway)) return { teams, known: true };
-            if ((bHome && !aHome) || (aAway && !bAway)) return { teams: [teams[1], teams[0]], known: true };
+            const straight = compScore(teams[0], meta.home) + compScore(teams[1], meta.away);
+            const crossed = compScore(teams[0], meta.away) + compScore(teams[1], meta.home);
+            if (straight > crossed && (compScore(teams[0], meta.home) || compScore(teams[1], meta.away))) return { teams, known: true };
+            if (crossed > straight && (compScore(teams[0], meta.away) || compScore(teams[1], meta.home))) return { teams: [teams[1], teams[0]], known: true };
         }
         // Secondary signal: team field 3 behaved like an is-home flag in the
         // captured series. Weaker than a name match, but better than the slot.
@@ -674,6 +691,86 @@
         time_expired: 'time',
     };
 
+    // A round verdict that cannot be a real CS round. Rounds need a freeze
+    // time plus play, so two verdicts 20s apart are impossible, and a win on
+    // time needs the whole round clock (1:55). The incident that prompted this:
+    // ROUND 15 at 11:47:32, ROUND 16 "time" at 11:47:48 - a disconnect, not a
+    // round. Pauses only make real gaps longer, never shorter.
+    const MIN_ROUND_GAP_S = 20;
+    const MIN_TIME_WIN_GAP_S = 100;
+    function roundSuspicion(g, mn, entry) {
+        const prev = (g.roundHistory[mn] || []).find(r => r.round === entry.round - 1);
+        if (!prev || !prev.at) return null;
+        const gap = (entry.at - prev.at) / 1000;
+        if (gap < MIN_ROUND_GAP_S) return `ended ${Math.round(gap)}s after round ${prev.round}`;
+        if (entry.reason === 'time' && gap < MIN_TIME_WIN_GAP_S) {
+            return `"time" win ${Math.round(gap)}s after round ${prev.round} — a round clock is 1:55`;
+        }
+        return null;
+    }
+
+    // Death audit. A player whose alive flag drops to 0 must have a kill in
+    // the feed (world kills - C4, falls - included). One that does not is
+    // what a disconnect looks like: GRID zeroes the player, and with enough of
+    // them gives the round away "by elimination". The feed carries one kill
+    // per frame, and the flag and its kill do not always share a frame, so a
+    // drop gets a few seconds to be explained before it is flagged; a kill
+    // arriving even later clears the flag again.
+    const DEATH_GRACE_MS = 6000;
+    const KILL_MATCH_MS = 8000;
+    // Only drops that happen while a round is really being played count:
+    // betboom entered 'round' for this round number and no verdict has landed
+    // yet. GRID zeroes everyone between rounds (and at the side switch after
+    // round 12 it zeroed all eight players still alive), and a bomb can even
+    // be "planted" after the round is over; 1.11.0 flagged all of that.
+    function auditDeaths(g, liveMap) {
+        const now = Date.now();
+        if (liveMap) {
+            const mn = liveMap.num;
+            const total = Object.values(liveMap.sides).reduce((a, sd) => a + sd.rounds, 0);
+            if (g.phase === 'round' && g.auditRound !== mn + ':' + (total + 1)) g.auditRound = mn + ':' + (total + 1);
+            const inPlay = g.auditRound === mn + ':' + (total + 1) &&
+                (g.phase === 'round' || g.phase === 'bomb_has_been_planted');
+            for (const tid in liveMap.sides) {
+                const alive = liveMap.sides[tid].alive;
+                for (const steam in alive) {
+                    const key = mn + ':' + steam;
+                    const before = g.prevAlive[key];
+                    if (inPlay && before === 1 && alive[steam] === 0) {
+                        g.pendingDeaths.push({ steam, key, tid: String(tid), map: mn, round: total + 1, at: now });
+                    }
+                    g.prevAlive[key] = alive[steam];
+                }
+            }
+        }
+        g.pendingDeaths = g.pendingDeaths.filter(d => {
+            const k = g.killedAt[d.steam];
+            if (k && Math.abs(k - d.at) <= KILL_MATCH_MS) return false;          // explained
+            if (g.prevAlive[d.key] === 1) return false;                          // back alive: a blip
+            if (now - d.at < DEATH_GRACE_MS) return true;                        // still waiting
+            const who = nickOf(g, d.steam);
+            g.unexplained.push({ steam: d.steam, nick: who.nick, team: who.team, teamId: d.tid,
+                map: d.map, round: d.round, at: d.at, resolved: false });
+            if (g.unexplained.length > 40) g.unexplained.shift();
+            // Informational only (1.11.3): the feed carries one kill per frame,
+            // so in a quick trade a kill can be lost (nbqq -> Norwi, Brute-BakS
+            // round 19) - worth a look, not proof of a disconnect.
+            logEvent(g, 'warn', `NO KILL: ${who.nick} died with no kill in the feed — kill lost or disconnect?`,
+                who.idx, { mapNum: d.map });
+            S.dirty = true;
+            return false;
+        });
+    }
+    function resolveLateKill(g, victim) {
+        const now = Date.now();
+        g.unexplained.forEach(u => {
+            if (!u.resolved && u.steam === victim && now - u.at < 60000) {
+                u.resolved = true;
+                logEvent(g, 'phase', `NO KILL cleared: the kill for ${u.nick} arrived late`, undefined, { mapNum: u.map });
+            }
+        });
+    }
+
     function backfillRounds(g, m) {
         if (!m || !m.history || !m.history.length) return;
         const mn = m.num;
@@ -688,7 +785,22 @@
             const teamId = r[2];
             const side = r[3];
             if (!roundNo || !teamId || !side) return;
-            if (hist.some(x => x.round === roundNo)) return;
+            const have = hist.find(x => x.round === roundNo);
+            if (have) {
+                // A round we saw live had its reason inferred from the score
+                // bump ("survivors -> time"). The feed's own reason is the
+                // authority: adopt it, and flag a code we do not know (a
+                // forfeit, an admin decision) instead of letting it pass as time.
+                if (!have.fromFeed && !have.feedChecked) {
+                    have.feedChecked = true;
+                    if (r[4] && !FEED_REASON[r[4]]) {
+                        have.suspect = have.suspect || `unknown end reason "${r[4]}" in the feed`;
+                    } else if (FEED_REASON[r[4]] && FEED_REASON[r[4]] !== have.reason) {
+                        have.reason = FEED_REASON[r[4]];
+                    }
+                }
+                return;
+            }
 
             // homeSide anchors the half boundary in the strip. The feed only
             // states the WINNER's side, so for a round the home team lost we
@@ -702,6 +814,7 @@
             const entry = {
                 round: roundNo, teamId: String(teamId), side, homeSide,
                 reason: FEED_REASON[r[4]] || 'time', fromFeed: true,
+                suspect: (r[4] && !FEED_REASON[r[4]]) ? `unknown end reason "${r[4]}" in the feed` : null,
             };
             hist.push(entry);
             seeded.push(entry);
@@ -866,11 +979,16 @@
                         // Guard against a duplicate if the same win is somehow
                         // seen twice (re-subscribe replaying a snapshot).
                         if (g.roundHistory[mn].some(r => r.round === roundNo)) continue;
-                        g.roundHistory[mn].push({
+                        const entry = {
                             round: roundNo, teamId: tid, side: liveMap.sides[tid].side,
-                            homeSide, reason,
-                        });
+                            homeSide, reason, at: Date.now(),
+                        };
+                        entry.suspect = roundSuspicion(g, mn, entry);
+                        g.roundHistory[mn].push(entry);
                         const tName = (g.teams.find(t => t.id === tid) || {}).name || tid;
+                        if (entry.suspect) {
+                            logEvent(g, 'warn', `IRREGULAR ROUND ${roundNo}: ${entry.suspect}`, undefined, { mapNum: mn });
+                        }
                         logEvent(g, 'round', `ROUND ${roundNo} — ${tName} wins (${REASON[reason]})`,
                             undefined, { side: liveMap.sides[tid].side, teamId: tid, mapNum: mn });
                         if (isActive) play('roundEnd');
@@ -898,6 +1016,7 @@
             sampleLatency(kill[6], matchId, isActive);
             processKill(g, kill, liveMap, isActive);
         }
+        auditDeaths(g, liveMap);
 
         g.lastUpdate = Date.now();
         if (!S.soundReady) setTimeout(() => { S.soundReady = true; }, 2500);
@@ -981,6 +1100,13 @@
         // Last-seen weapon is per round; wipe it as soon as the round number moves.
         if (g.weapRound !== round) { g.weapRound = round; g.roundWeapons = {}; }
 
+        // Every death the feed explains, world kills included: the death audit
+        // checks each drop to 0 against this.
+        if (victim) {
+            g.killedAt[victim] = Date.now();
+            resolveLateKill(g, victim);
+        }
+
         if (world || !weapon) {
             statFor(g, mn, victim).d += 1;
             logEvent(g, 'suicide', `SUICIDE: ${v.nick} (world kill)`);
@@ -1001,8 +1127,13 @@
         g.roundWeapons[killer] = weapon;
 
         const aTxt = assist ? ` +${nickOf(g, assist).nick}` : '';
+        // Colours follow the SIDE each player was on at the moment of the kill
+        // (CT blue, T yellow, as in game), not home/away: after the side switch
+        // home/away colours read inverted. Stored per row, so old rows keep the
+        // side they had. A row in one colour is still a team kill.
+        const sideAt = t => (liveMap && t !== null && t !== undefined && liveMap.sides[t]) ? (SIDE[liveMap.sides[t].side] || null) : null;
         logEvent(g, 'kill', `${k.nick} (${weaponName(weapon)}) killed ${v.nick}${hs ? ' · HS' : ''}${aTxt}`,
-            k.idx);
+            k.idx, { vic: { nick: v.nick, idx: v.idx, side: sideAt(v.teamId) }, killSide: sideAt(k.teamId) });
 
         if (!isActive) return;
         if (k.idx === 0) play('killHome');
@@ -1021,6 +1152,8 @@
             mapNum: meta.mapNum !== undefined ? meta.mapNum : g.liveMapNum,
             side: meta.side || null,
             teamId: meta.teamId !== undefined ? meta.teamId : null,
+            vic: meta.vic || null,
+            killSide: meta.killSide || null,
         });
         if (g.events.length > 400) g.events.shift();
     }
@@ -1041,6 +1174,7 @@
     function linkSnapshot() {
         const g = S.active ? S.games.get(S.active) : null;
         if (!g) return { matchId: S.active || null, teams: [] };
+        auditDeaths(g, null);          // let pending drops time out between frames
         // The LIVE map, never the one selected in the HUD: browsing an old map
         // must not change what Raiden is fed.
         const m = g.maps.find(x => x.num === g.liveMapNum) || g.maps.find(x => x.live) || null;
@@ -1071,6 +1205,11 @@
             total: teams.reduce((a, t) => a + t.rounds, 0),
             history: m ? (g.roundHistory[m.num] || []).slice(-6).map(r => ({
                 round: r.round, side: SIDE[r.side] || null, reason: r.reason, teamId: String(r.teamId),
+                suspect: r.suspect || null,
+            })) : [],
+            // Unexplained drops to 0 on the live map, still unresolved.
+            unexplained: m ? g.unexplained.filter(u => u.map === m.num && !u.resolved).slice(-10).map(u => ({
+                nick: u.nick, team: u.team, teamId: u.teamId, round: u.round, at: u.at,
             })) : [],
             lastUpdate: g.lastUpdate, latency: latencyOf(g.matchId),
         };
@@ -1623,6 +1762,13 @@
 .mh-ev.kill span{color:#c6d5e8}
 .mh-ev.kill.home span{color:#8fc4ff}
 .mh-ev.kill.away span{color:#e5bd75}
+.mh-ev.kill span.mh-vic.v-home{color:#8fc4ff}
+.mh-ev.kill span.mh-vic.v-away{color:#e5bd75}
+.mh-ev.kill.kCT span{color:#8fc4ff}
+.mh-ev.kill.kT span{color:#e5bd75}
+.mh-ev.kill span.mh-vic.v-CT{color:#8fc4ff}
+.mh-ev.kill span.mh-vic.v-T{color:#e5bd75}
+.mh-ev.warn span{color:#ff6b6b;font-weight:600}
 .mh-ev.bomb span{color:#ff8a5c;font-weight:600}
 .mh-ev.round span{color:#9fb2c9;font-weight:600}
 .mh-ev.round.T span{color:#e0a441}
@@ -2340,7 +2486,10 @@
             // eye is already tracking T vs CT, and two teams sharing one colour
             // made the winner unreadable at a glance.
             const sd = e.side && SIDE[e.side] ? ' ' + SIDE[e.side] : '';
-            const row = el('div', 'mh-ev ' + e.type + who + sd);
+            // Kill rows: coloured by the killer's side when it is known (rows
+            // logged before 1.11.3 fall back to home/away).
+            const ks = e.type === 'kill' && e.killSide ? ' k' + e.killSide : '';
+            const row = el('div', 'mh-ev ' + e.type + (ks || who) + sd);
 
             const t = document.createElement('time');
             t.textContent = e.t ? hhmmss(e.t) : '—';
@@ -2361,7 +2510,17 @@
                 row.appendChild(ph);
             }
 
-            row.appendChild(el('span', '', e.text));
+            const txt = el('span', '');
+            const cut = e.vic ? e.text.indexOf(' killed ' + e.vic.nick) : -1;
+            const vcls = e.vic && e.vic.side ? 'v-' + e.vic.side
+                : (e.vic && e.vic.idx === 0 ? 'v-home' : (e.vic && e.vic.idx === 1 ? 'v-away' : ''));
+            if (cut >= 0 && vcls) {
+                const at = cut + ' killed '.length;
+                txt.append(e.text.slice(0, at),
+                    el('span', 'mh-vic ' + vcls, e.vic.nick),
+                    e.text.slice(at + e.vic.nick.length));
+            } else txt.textContent = e.text;
+            row.appendChild(txt);
             box.appendChild(row);
         });
         if (stick) box.scrollTop = box.scrollHeight;
