@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.9.0
+// @version      1.10.0
 // @description  bb scraper
-// @icon         https://betboom.ru/favicon.ico
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=oddin.gg
 // @author       GG
 // @match        https://betboom.ru/esport/*
 // @match        https://betboom.ru/sport/*
@@ -903,6 +903,7 @@
         if (!S.soundReady) setTimeout(() => { S.soundReady = true; }, 2500);
         reconcileActive();
         S.dirty = true;
+        if (isActive) linkSoon();
     }
 
     // The feed stamps each event at the source, so receivedAt - eventTime is a
@@ -1022,6 +1023,71 @@
             teamId: meta.teamId !== undefined ? meta.teamId : null,
         });
         if (g.events.length > 400) g.events.shift();
+    }
+
+    // =====================================================================
+    // 7b. LINK — hand the live state to Dibu Link (Raiden trader inputs)
+    // =====================================================================
+
+    // Dibu has to stay @grant none (see the header), so it cannot reach
+    // Tampermonkey's cross-tab storage. It posts a compact snapshot on its own
+    // window instead; dibu-link.user.js, which does have the grants, picks it up
+    // here on betboom and relays it to the Raiden tab. Raiden never re-parses
+    // betboom: what counts as alive, which side a team is on and how a round
+    // ended is decided once, here, from the same state the HUD draws.
+    const LINK_TAG = 'dibu-link:v1';
+    let linkLastPost = 0, linkTimer = null;
+
+    function linkSnapshot() {
+        const g = S.active ? S.games.get(S.active) : null;
+        if (!g) return { matchId: S.active || null, teams: [] };
+        // The LIVE map, never the one selected in the HUD: browsing an old map
+        // must not change what Raiden is fed.
+        const m = g.maps.find(x => x.num === g.liveMapNum) || g.maps.find(x => x.live) || null;
+        const meta = S.matches.get(g.matchId);
+        const teams = g.teams.map(t => {
+            const s = m && m.sides[t.id];
+            const vals = s ? Object.values(s.alive) : [];
+            return {
+                id: String(t.id), name: t.name || '',
+                side: s ? (SIDE[s.side] || null) : null,
+                rounds: s ? (s.rounds || 0) : 0,
+                // n, alive and dead are sent apart on purpose: a value that is
+                // neither 0 nor 1, or a lineup that is not five, is what a
+                // disconnect is expected to look like, and Link holds on it.
+                n: vals.length,
+                alive: vals.filter(v => v === 1).length,
+                dead: vals.filter(v => v === 0).length,
+            };
+        });
+        return {
+            matchId: g.matchId,
+            title: (meta && meta.home && meta.away)
+                ? `${meta.home.name} vs ${meta.away.name}` : teams.map(t => t.name).join(' vs '),
+            mapNum: m ? m.num : null, mapName: m ? (m.name || '') : '', mapLive: !!(m && m.live),
+            phase: g.phase, phaseStart: g.phaseStart, phaseDur: g.phaseDur,
+            bombPlanted: !!g.bombPlanted,
+            teams,
+            total: teams.reduce((a, t) => a + t.rounds, 0),
+            history: m ? (g.roundHistory[m.num] || []).slice(-6).map(r => ({
+                round: r.round, side: SIDE[r.side] || null, reason: r.reason, teamId: String(r.teamId),
+            })) : [],
+            lastUpdate: g.lastUpdate, latency: latencyOf(g.matchId),
+        };
+    }
+
+    function linkPost() {
+        linkLastPost = Date.now();
+        try { PAGE.postMessage({ tag: LINK_TAG, at: linkLastPost, snap: linkSnapshot() }, location.origin); }
+        catch (e) { /* never break the page */ }
+    }
+
+    // Grid frames can come in bursts; Raiden only needs the latest state, so
+    // coalesce them, but never sit on a kill for more than ~120ms.
+    function linkSoon() {
+        if (linkTimer) return;
+        const wait = Math.max(0, 120 - (Date.now() - linkLastPost));
+        linkTimer = setTimeout(() => { linkTimer = null; linkPost(); }, wait);
     }
 
     // =====================================================================
@@ -2755,6 +2821,9 @@
         setInterval(probeMatches, 700);
         checkClock();
         setInterval(checkClock, 600000);
+        // Heartbeat for Dibu Link: tells Raiden this tab is alive even while the
+        // feed is quiet (freezetime), and follows a change of selected match.
+        setInterval(linkPost, 1000);
 
         // Clock ticks separately so the panel isn't repainted 4x/second.
         setInterval(() => {
