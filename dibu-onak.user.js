@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dibu Onak (bb + Polymarket → Raiden)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      3.2.0
+// @version      3.3.0
 // @description  Feeds Dibu Scraper's betboom state and Polymarket's live score into Raiden's CS2 trader inputs
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=oddin.gg
 // @author       GG
@@ -735,6 +735,7 @@
     const L = {
         me: Math.random().toString(36).slice(2, 10),
         frameActive: false,
+        onMap: null,
         auth: null,                 // { authorization, apiKey }
         jadeUrl: ENV.jade,
         ws: null,
@@ -784,6 +785,18 @@
 
     // The route lives on the TOP window's hash; the app itself runs in an
     // app.html iframe of the same origin, which is where its traffic is.
+    // Production: Onak lives only on a map's clean-data page
+    // (#/matches/<match>/maps/<map>). Raiden keeps several tabs open on the
+    // same match (timeline, trading stream, kiki...) and the panel on all of
+    // them was clutter. Test: any page, until its URLs are known.
+    const MAP_PAGE_RE = /^#\/matches\/[^/?#]+\/maps\/[^/?#]+\/?(\?.*)?$/;
+    function onMapPage() {
+        if (ENV.test) return true;
+        let hash = '';
+        try { hash = W.top.location.hash || ''; } catch (e) { hash = location.hash || ''; }
+        return MAP_PAGE_RE.test(hash);
+    }
+
     function currentRoute() {
         let hash = '';
         try { hash = W.top.location.hash || ''; } catch (e) { hash = location.hash || ''; }
@@ -1177,6 +1190,16 @@
 
     function tick() {
         if (!L.frameActive) return;
+        // Off the map page: hidden, and never acting. Leaving the page while
+        // ON switches it off, so coming back never resumes sending by surprise.
+        const here = onMapPage();
+        if (here !== L.onMap) {
+            L.onMap = here;
+            if (root) root.style.display = here ? '' : 'none';
+            if (!here && L.armed) { setArmed(false); logLine('left the map page — Onak switched off', 'warn'); }
+            dirty = true;
+        }
+        if (!here) return;
         const now = Date.now();
         // Events (Raiden's clean data every second while a round runs, every
         // betboom frame) are never throttled, unlike timers. Riding them keeps
@@ -1765,6 +1788,8 @@
         root.style.left = Math.min(pos.x, innerWidth - 120) + 'px';
         root.style.top = Math.min(pos.y, innerHeight - 40) + 'px';
         if (GM_getValue('onak:min', false)) root.classList.add('min');
+        L.onMap = onMapPage();
+        if (!L.onMap) root.style.display = 'none';
 
         const head = el('div'); head.id = 'dl-head';
         const title = el('div'); title.id = 'dl-title';
@@ -1824,7 +1849,7 @@
         });
 
         addEventListener('keydown', e => {
-            if (e.altKey && (e.key === 'l' || e.key === 'L')) { e.preventDefault(); setArmed(!L.armed); }
+            if (e.altKey && (e.key === 'l' || e.key === 'L') && L.onMap) { e.preventDefault(); setArmed(!L.armed); }
         });
 
         setInterval(() => { if (dirty) { dirty = false; render(); } }, 300);
