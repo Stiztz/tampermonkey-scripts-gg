@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Dibu Onak (bb + Polymarket → Raiden)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      3.3.0
+// @version      3.5.0
 // @description  Feeds Dibu Scraper's betboom state and Polymarket's live score into Raiden's CS2 trader inputs
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=oddin.gg
 // @author       GG
 // @match        https://betboom.ru/esport/*
 // @match        https://betboom.ru/sport/*
 // @match        https://polymarket.com/*
+// @match        https://cross.bet/*
+// @match        https://www.cross.bet/*
 // @match        https://raiden.oddin.gg/*
 // @match        https://raiden-test.oddin.dev/*
 // @run-at       document-start
@@ -34,6 +36,9 @@
  *   polymarket   : this script polls the event's series-state (the score
  *                  Polymarket shows in real time) and stores it under
  *                  'onak:pm'. Only the map score is used.
+ *   cross.bet    : this script reads the page's own socket.io stream
+ *                  (scoreUpdate / mapScore / map name) and stores the round
+ *                  score under 'onak:cb', with a 1s heartbeat.
  *   Raiden tab   : this script hooks the page's fetch/WebSocket to read the
  *                  live clean data and borrow the session's credentials, then
  *                  sends the same GraphQL mutations the trader panel sends.
@@ -142,6 +147,83 @@
         return;
     }
 
+    // =====================================================================
+    // 1c. CROSS.BET HALF — publish the live round score
+    // =====================================================================
+    // cross.bet pushes its scoreboard over socket.io on the page's own
+    // connection (frames like 42["scoreUpdate",{...}]); there is no API Raiden
+    // could ask, so this tab has to stay open. The stream carries the round
+    // score as home/away, the map number and the map name, but no team names:
+    // those are read from the page. The score only arrives when it changes,
+    // so a heartbeat every second tells Raiden the source is still alive.
+    if (/(^|\.)cross\.bet$/.test(HOST)) {
+        if (window.top !== window.self) return;
+        const CB = {
+            matchId: (location.pathname.match(/\/match\/(\d+)/) || [])[1] || null,
+            home: null, away: null, homeScore: null, awayScore: null,
+            mapNum: null, mapName: null, mapsHome: null, mapsAway: null,
+            lastMsgAt: 0, sockets: 0,
+        };
+        const parseIo = text => {
+            const m = /^42(\[[\s\S]*\])$/.exec(text);
+            if (!m) return null;
+            try { const a = JSON.parse(m[1]); return Array.isArray(a) && typeof a[0] === 'string' ? a : null; } catch (e) { return null; }
+        };
+        const onFrame = text => {
+            if (typeof text !== 'string') return;
+            const ev = parseIo(text);
+            if (!ev) return;
+            const [name, d] = ev;
+            if (!d || (CB.matchId && d.matchId && String(d.matchId) !== CB.matchId)) return;
+            if (name === 'scoreUpdate' && typeof d.roundScore_home === 'number') {
+                CB.homeScore = d.roundScore_home; CB.awayScore = d.roundScore_away;
+            } else if (name === 'mapScore') {
+                if (typeof d.mapNum === 'number') CB.mapNum = d.mapNum;
+                CB.mapsHome = d.mapScore_home; CB.mapsAway = d.mapScore_away;
+            } else if (name === 'utilsUpdate' && d.type === 'map') {
+                CB.mapName = d.map || null;
+            } else return;
+            CB.lastMsgAt = Date.now();
+            publish();
+        };
+        const OrigWS = W.WebSocket;
+        const Hooked = function (url, protocols) {
+            const ws = protocols === undefined ? new OrigWS(url) : new OrigWS(url, protocols);
+            if (/socket\.io/.test(String(url))) {
+                CB.sockets++;
+                ws.addEventListener('message', ev => onFrame(ev.data));
+                ws.addEventListener('close', () => { CB.sockets = Math.max(0, CB.sockets - 1); publish(); });
+            }
+            return ws;
+        };
+        Hooked.prototype = OrigWS.prototype;
+        ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(k => { Hooked[k] = OrigWS[k]; });
+        try { W.WebSocket = Hooked; } catch (e) { console.error('[Dibu Onak] could not patch WebSocket on cross.bet:', e); }
+
+        // Team names from the page: the title, else a short "X vs Y" line.
+        const VS = /^\s*(.{1,40}?)\s+vs\.?\s+(.{1,40}?)\s*(?:[-|–—:].*)?$/i;
+        const readNames = () => {
+            let m = VS.exec(document.title || '');
+            if (!m && document.body) {
+                const lines = (document.body.innerText || '').split('\n').map(x => x.trim()).filter(x => x && x.length < 90);
+                for (const l of lines) { m = /^(.{1,40}?)\s+vs\.?\s+(.{1,40})$/i.exec(l); if (m) break; }
+            }
+            if (m) { CB.home = m[1].trim(); CB.away = m[2].trim(); }
+        };
+        function publish() {
+            if (!CB.home) readNames();
+            try {
+                GM_setValue('onak:cb', {
+                    at: Date.now(), url: location.href, matchId: CB.matchId, home: CB.home, away: CB.away,
+                    homeScore: CB.homeScore, awayScore: CB.awayScore, mapNum: CB.mapNum, mapName: CB.mapName,
+                    mapsHome: CB.mapsHome, mapsAway: CB.mapsAway, lastMsgAt: CB.lastMsgAt, alive: CB.sockets > 0,
+                });
+            } catch (e) { /* storage busy: the next heartbeat retries */ }
+        }
+        everyMs(1000, publish);
+        return;
+    }
+
     // Production and the test environment run the same app against
     // different hosts; everything below only differs in the jade URL and in
     // how strict the safety checks are (see `relaxed` in decide()).
@@ -183,10 +265,12 @@
     // How long Raiden's and betboom's scores may disagree before it counts as
     // a wrong score (production only; test mode never matches scores).
     const SCORE_MISMATCH_MS = 30000;
+    const LAG_ON = 20, LAG_OFF = 15;      // betboom delay alert, seconds
     const SIDE_OF = { CT: 'LIGHT', T: 'DARK' };
     const ROUND_TIME = 115;
 
-    const normName = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    // Accents are folded, not dropped: "Sökerorg" reads as "sokerorg".
+    const normName = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
     // "de_inferno", "Inferno", "INFERNO" -> "inferno"
     const mapNameKey = s => normName(String(s || '').replace(/^(de|cs|ar|dz)_/i, ''));
 
@@ -235,6 +319,15 @@
         const crossed = sc(p0.name, b1.name) + sc(p1.name, b0.name);
         if (straight > crossed && sc(p0.name, b0.name) && sc(p1.name, b1.name)) return { [p0.name]: b0, [p1.name]: b1 };
         if (crossed > straight && sc(p0.name, b1.name) && sc(p1.name, b0.name)) return { [p0.name]: b1, [p1.name]: b0 };
+        // One name is enough when it is unambiguous: it matches exactly one
+        // team and the other name matches none ("Sökerorg" = "Sokerorg
+        // Esports", so "6yuBoJIbI" must be the other one).
+        const hits = [[p0, b0], [p0, b1], [p1, b0], [p1, b1]].filter(([p, b]) => sc(p.name, b.name) > 0);
+        if (hits.length === 1) {
+            const [p, b] = hits[0];
+            const op = p === p0 ? p1 : p0, ob = b === b0 ? b1 : b0;
+            return { [p.name]: b, [op.name]: ob };
+        }
         return null;
     }
 
@@ -283,57 +376,94 @@
      * round while betboom is quiet or frozen (2.4.0).
      * Returns { win: { side, type, round, bbRound } | null, warn: string|null }.
      */
+    // Score sources in the order they are tried. Each one only says WHO won
+    // a round; the first that has a valid point for the round Raiden has live
+    // closes it, the others stay as a cross-check.
+    //   src = { key, label, at, alive, snap: { via, map: { seq, teams: [{ name, label?, score }] } },
+    //           wins: [{ map, round, winner, scores, at }], pairing: { <team name>: 'home'|'away' } | null }
+    // `name` is the key wins use ("A NATA" on Polymarket, "home"/"away" on
+    // Cross.bet); `label` is the display name used to pair with Raiden.
+    function scoreSources(ctx) {
+        const out = [];
+        if (ctx.opts.pm && ctx.pm) out.push(Object.assign({ key: 'pm', label: 'Polymarket' }, ctx.pm));
+        if (ctx.opts.cb !== false && ctx.cb) out.push(Object.assign({ key: 'cb', label: 'Cross.bet' }, ctx.cb));
+        return out;
+    }
+
     function pmVerdict(ctx, st, now) {
+        const srcs = scoreSources(ctx);
+        let warn = null;
+        for (const src of srcs) {
+            const v = sourceVerdict(src, ctx, st, now);
+            if (v.win) return v;
+            if (v.warn && !warn) warn = v.warn;
+        }
+        return { win: null, warn };
+    }
+
+    function sourceVerdict(src, ctx, st, now) {
         const res = { win: null, warn: null };
-        const { pm, rd, bb, opts, rt } = ctx;
+        const { rd, bb, rt } = ctx;
         const relaxed = !!ctx.relaxed;
-        if (!opts.pm || !pm || !pm.snap || !pm.snap.map || !rd) return res;
+        const name = src.label;
+        if (!src.snap || !src.snap.map || !rd) return res;
         const R = rd.round;
         const wantRound = relaxed ? st.bbRoundFor[R] : R;
         if (wantRound === undefined) return res;
-        if (now - pm.at > 5000) {
-            res.warn = `Polymarket data ${Math.round((now - pm.at) / 1000)}s old — using betboom only` +
-                (pm.snap.via === 'tab' ? ' (Polymarket tab in background? set a link instead)' : '');
+        if (now - src.at > 5000 || src.alive === false) {
+            res.warn = `${name} data ${Math.round((now - src.at) / 1000)}s old — not used` +
+                (src.key === 'pm' && src.snap.via === 'tab' ? ' (Polymarket tab in background? set a link instead)' : '') +
+                (src.key === 'cb' ? ' (is the Cross.bet tab open?)' : '');
             return res;
         }
         const mapNo = relaxed ? (bb && bb.mapNum) : (ctx.raidenMapOrder || (bb && bb.mapNum));
-        if (mapNo && pm.snap.map.seq !== mapNo) {
-            res.warn = `Polymarket is on map ${pm.snap.map.seq}, ${relaxed ? 'bb' : 'Raiden'} on map ${mapNo} — ignoring Polymarket`;
+        if (mapNo && src.snap.map.seq && src.snap.map.seq !== mapNo) {
+            res.warn = `${name} is on map ${src.snap.map.seq}, ${relaxed ? 'bb' : 'Raiden'} on map ${mapNo} — ignoring ${name}`;
             return res;
         }
         // The point must have happened while this Raiden round was live: one
         // scored before it started belongs to an earlier round.
         const since = Math.min(st.start[R] || Infinity, st.seenAt[R] || Infinity);
-        const w = (pm.wins || []).find(x => x.round === wantRound && x.map === pm.snap.map.seq && x.at >= since - 1000);
+        const w = (src.wins || []).find(x => x.round === wantRound && x.map === src.snap.map.seq && x.at >= since - 1000);
         if (!w) return res;
-        const pmLoser = Object.keys(w.scores).find(n => n !== w.winner);
+        const loser = Object.keys(w.scores).find(n => n !== w.winner);
+        const teams = src.snap.map.teams;
+        const labelOf = k => { const t = teams.find(x => x.name === k); return (t && t.label) || k; };
+        const labelled = teams.map(t => ({ name: t.label || t.name }));
 
-        // Winner's side. Production: Raiden's teams. Relaxed or no Raiden
-        // names: betboom's current sides.
+        // Winner's side. Production: Raiden's teams (manual pairing first, then
+        // names). Relaxed or no Raiden names: betboom's current sides.
         let side = null;
-        if (!relaxed && rt && rt.home && rt.away) {
+        const roleSide = role => ((role === 'home') === rd.homeIsDark ? 'T' : 'CT');
+        if (!relaxed && src.pairing && src.pairing[w.winner]) side = roleSide(src.pairing[w.winner]);
+        if (!side && !relaxed && rt && rt.home && rt.away) {
             const roles = [{ name: rt.home.name, role: 'home' }, { name: rt.away.name, role: 'away' }];
             const shorts = [{ name: rt.home.short, role: 'home' }, { name: rt.away.short, role: 'away' }];
-            const m = pmTeamMap(pm.snap.map.teams, roles) || pmTeamMap(pm.snap.map.teams, shorts);
-            if (m && m[w.winner]) side = (m[w.winner].role === 'home') === rd.homeIsDark ? 'T' : 'CT';
+            const m = pmTeamMap(labelled, roles) || pmTeamMap(labelled, shorts);
+            const hit = m && m[labelOf(w.winner)];
+            if (hit) side = roleSide(hit.role);
         }
         if (!side && bb && bb.teams && bb.teams.length === 2) {
-            const m = pmTeamMap(pm.snap.map.teams, bb.teams);
-            if (m && m[w.winner]) side = m[w.winner].side || null;
+            const m = pmTeamMap(labelled, bb.teams);
+            const hit = m && m[labelOf(w.winner)];
+            if (hit) side = hit.side || null;
         }
-        if (!side) { res.warn = 'cannot tell which side won on Polymarket (team names do not match) — ignoring'; return res; }
+        if (!side) {
+            res.warn = `cannot tell which side won on ${name} (team names do not match${src.key === 'cb' ? ' — pair them in Setup' : ''}) — ignoring`;
+            return res;
+        }
 
         // Production: the point must land on Raiden's current score - the
         // winner's side one ahead, the loser equal.
         if (!relaxed) {
             const rdOf = sd => (sd === 'CT' ? rd.light.score : rd.dark.score);
             const other = side === 'CT' ? 'T' : 'CT';
-            if (rdOf(side) + 1 !== w.scores[w.winner] || rdOf(other) !== w.scores[pmLoser]) {
-                res.warn = `Polymarket score ${w.scores[w.winner]}-${w.scores[pmLoser]} does not follow Raiden's — ignoring`;
+            if (rdOf(side) + 1 !== w.scores[w.winner] || rdOf(other) !== w.scores[loser]) {
+                res.warn = `${name} score ${w.scores[w.winner]}-${w.scores[loser]} does not follow Raiden's — ignoring`;
                 return res;
             }
         }
-        res.win = { side, type: pmResultType(side, rd, bb, now), round: R, bbRound: wantRound };
+        res.win = { side, type: pmResultType(side, rd, bb, now), round: R, bbRound: wantRound, source: src.key, label: name };
         return res;
     }
 
@@ -371,8 +501,10 @@
     }
 
     /*
+     * ctx.pm / ctx.cb: score sources, see scoreSources().
      * ctx: { armed, leader, auth, wsOpen, error, bb, bbAt, rd, mapping,
-     *        raidenMapOrder, opts, relaxed, pm, oldLink, rdWatchedMs, rt, rdMapName }
+     *        raidenMapOrder, opts, relaxed, pm, oldLink, rdWatchedMs, rt, rdMapName,
+     *        authWaitMs }
      * rt : Raiden's teams { home:{name,short}, away:{name,short} } or null
      * pm : { at, snap, wins:[{ map, round, winner, scores:{name:score}, at }] }
      *
@@ -407,7 +539,7 @@
             const grace = st.autoClose[R] ? AUTO_CLOSE_GRACE - (now - st.autoClose[R]) : 0;
             if (v.win && ctx.opts.result && !ctx.rd.paused && st.seen[R] && !st.result[R] && grace <= 0 &&
                 !st.bbDone[v.win.bbRound]) {
-                out.actions.push({ op: 'result', type: v.win.type, round: R, source: 'pm', bbRound: v.win.bbRound });
+                out.actions.push({ op: 'result', type: v.win.type, round: R, source: v.win.source, bbRound: v.win.bbRound });
             } else if (v.warn) out.warn.push(v.warn);
             return out;
         };
@@ -419,11 +551,26 @@
         if (!rd) return hold('no Raiden clean data (open the map)');
         if (!ctx.wsOpen) return hold('Raiden socket closed');
         if (!ctx.auth) return hold('waiting for Raiden credentials');
+        if (ctx.authWaitMs > 0) {
+            if (ctx.authWaitMs > 60000) {
+                alarm('auth', 'notify', 'Onak cannot write to Raiden: the session expired and no new credentials arrived — reload the Raiden tab');
+            }
+            return hold(`Raiden session renewed — waiting for new credentials (${Math.round(ctx.authWaitMs / 1000)}s)`);
+        }
         if (!ctx.leader) return hold('another Raiden tab controls this map');
 
         const bb = ctx.bb;
         if (!bb || now - ctx.bbAt > 4000) return bbHold('no signal from betboom (is the Dibu tab open?)');
         if (!bb.teams || bb.teams.length !== 2) return bbHold('betboom has no teams');
+        // betboom far behind live: inputs still flow, just late. Notify only,
+        // with hysteresis (on above 20s, off below 15s) so it does not flicker.
+        if (typeof bb.latency === 'number') {
+            if (bb.latency > LAG_ON) st.lagHigh = true;
+            else if (bb.latency < LAG_OFF) st.lagHigh = false;
+            if (st.lagHigh) {
+                alarm(`lag:${bb.matchId}`, 'notify', `betboom is ${Math.round(bb.latency)}s behind live — Onak's inputs arrive that late`);
+            }
+        }
         // betboom goes quiet between rounds and maps (freezetime, warmup), so
         // silence there is normal. Mid-round it means the data is not live.
         if (!bb.lastUpdate || (ROUND_PHASES.has(bb.phase) && now - bb.lastUpdate > 20000)) {
@@ -622,7 +769,7 @@
         const graceLeft = st.autoClose[R] ? AUTO_CLOSE_GRACE - (now - st.autoClose[R]) : 0;
         if (opts.result && !entry && pmWin && st.seen[R] && !st.result[R] && graceLeft <= 0) {
             // Polymarket first: close now with the inferred type.
-            out.actions.push({ op: 'result', type: pmWin.type, round: R, source: 'pm', bbRound: wantRound });
+            out.actions.push({ op: 'result', type: pmWin.type, round: R, source: pmWin.source, bbRound: wantRound });
         } else if (opts.result && (entry || pmWin) && st.seen[R] && !st.result[R] && graceLeft > 0) {
             out.info.push(`round ${R} over — waiting ${Math.ceil(graceLeft / 1000)}s for Raiden to close it`);
         } else if (opts.result && entry && st.seen[R] && !st.result[R]) {
@@ -755,6 +902,7 @@
         bb: null, bbAt: 0, bbTabs: {}, bbTab: null, bbOpen: 0, bbMatches: 0,
         trace: [], traceSig: null,
         pm: null, pmAt: 0, pmLast: null, pmWins: [],
+        cb: null, cbAt: 0, cbLast: null, cbWins: [],
         armed: false,
         error: null,
         busy: false,
@@ -768,7 +916,7 @@
     // a ReferenceError that takes the whole script down.
     let root = null, dirty = true;
     // relaxed only has an effect on the test host; production ignores it.
-    const OPT_DEFAULTS = { start: true, deaths: true, bomb: true, result: true, confirm: false, relaxed: true, pm: true, suspend: true, checks: true };
+    const OPT_DEFAULTS = { start: true, deaths: true, bomb: true, result: true, confirm: false, relaxed: true, pm: true, cb: true, suspend: true, checks: true };
     const OPTS = Object.assign({}, OPT_DEFAULTS, GM_getValue('onak:opts', {}) || {});
     // Validate on read: a stored key that no longer exists is dropped.
     Object.keys(OPTS).forEach(k => { if (!(k in OPT_DEFAULTS)) delete OPTS[k]; });
@@ -830,10 +978,92 @@
         return (auth && key) ? { authorization: auth, apiKey: key } : null;
     }
 
-    function setJadeAuth(a) {
+    // ---- Raiden credentials ---------------------------------------------
+    // Raiden's token is a JWT that expires (about an hour) and the page renews
+    // it on its own. The page's live socket authenticated once at connect and
+    // keeps working on the old token, but every input Onak sends is a new
+    // request checked on the spot. Up to 3.3.0 Onak kept the first token it
+    // saw from the socket, so ~1h in an input got HTTP 401 and Onak stopped
+    // (ALKA-Los Ninos 23 Oct, Nemesis-TSAB 27 Oct). Now: always take the
+    // freshest token seen, look in the page's storage when one is about to
+    // expire or is refused, and treat a 401 as "wait for a new token", not as
+    // an error.
+    const JWT_RE = /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g;
+    function jwtOf(authorization) {
+        const m = String(authorization || '').match(JWT_RE);
+        return m ? m[0] : null;
+    }
+    function jwtClaims(jwt) {
+        try {
+            const part = jwt.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+            return JSON.parse(atob(part + '==='.slice((part.length + 3) % 4))) || null;
+        } catch (e) { return null; }
+    }
+    function jwtExp(jwt) {
+        const c = jwt && jwtClaims(jwt);
+        return c && c.exp ? c.exp * 1000 : null;
+    }
+    // Same Cognito client, user, issuer and token type. Raiden's storage holds
+    // tokens of other clients and old sessions too (one valid until 16:00 for
+    // another client, on 28 Oct); "latest expiry" alone would pick one of those.
+    function sameKind(a, b) {
+        if (!a || !b) return false;
+        return a.iss === b.iss && a.sub === b.sub && a.token_use === b.token_use &&
+            (a.client_id || a.aud) === (b.client_id || b.aud);
+    }
+    const hhmm = t => new Date(t).toTimeString().slice(0, 5);
+
+    function setJadeAuth(a, from) {
         if (!a) return;
-        if (!L.auth) logLine('Raiden credentials captured');
+        const cur = L.auth;
+        if (cur && cur.authorization === a.authorization && cur.apiKey === a.apiKey) return;
+        // Never step back to an older token (a reconnecting socket can replay one).
+        const ne = jwtExp(jwtOf(a.authorization)), ce = cur ? jwtExp(jwtOf(cur.authorization)) : null;
+        if (cur && ne && ce && ne < ce) return;
         L.auth = a;
+        L.authExp = ne;
+        const until = ne ? ` (valid until ${hhmm(ne)})` : '';
+        logLine((cur ? 'Raiden credentials updated' : 'Raiden credentials captured') + until + (from ? ' · ' + from : ''));
+        if (L.authWait) { logLine('new credentials — inputs resume', 'start'); L.authWait = 0; }
+        dirty = true;
+    }
+
+    // The freshest unexpired token of the SAME kind as the one in use, from
+    // the page's cookies (where Raiden's Cognito keeps the live one) and its
+    // storage. Without a decodable current token there is nothing to match
+    // against, and nothing is swapped.
+    function storedJwt(like) {
+        if (!like) return null;
+        let best = null, bestExp = 0;
+        const now = Date.now();
+        const consider = v => {
+            if (!v || v.indexOf('eyJ') < 0) return;
+            (v.match(JWT_RE) || []).forEach(j => {
+                const c = jwtClaims(j);
+                const e = c && c.exp ? c.exp * 1000 : 0;
+                if (e > now && e > bestExp && sameKind(c, like)) { best = j; bestExp = e; }
+            });
+        };
+        [W.localStorage, W.sessionStorage].forEach(store => {
+            try { for (let i = 0; i < store.length; i++) consider(store.getItem(store.key(i))); } catch (e) { /* blocked */ }
+        });
+        [W.document, (() => { try { return W.top.document; } catch (e) { return null; } })()].forEach(doc => {
+            try {
+                if (doc) doc.cookie.split('; ').forEach(c => { const i = c.indexOf('='); if (i > 0) consider(decodeURIComponent(c.slice(i + 1))); });
+            } catch (e) { /* blocked */ }
+        });
+        return best;
+    }
+    function refreshFromStorage() {
+        if (!L.auth) return false;
+        const curJ = jwtOf(L.auth.authorization);
+        const like = curJ && jwtClaims(curJ);
+        const j = storedJwt(like);
+        if (!j || j === curJ) return false;
+        if (L.authExp && jwtExp(j) <= L.authExp) return false;
+        const auth = L.auth.authorization.replace(curJ, j);
+        setJadeAuth({ authorization: auth, apiKey: L.auth.apiKey }, 'from the page');
+        return true;
     }
 
     function onRoute(json) {
@@ -967,8 +1197,8 @@
                         if (typeof data === 'string' && data.indexOf('connection_init') >= 0) {
                             const j = JSON.parse(data);
                             const pl = j && j.payload;
-                            if (pl && pl.Authorization && pl['X-Api-Key'] && !L.auth) {
-                                setJadeAuth({ authorization: pl.Authorization, apiKey: pl['X-Api-Key'] });
+                            if (pl && pl.Authorization && pl['X-Api-Key']) {
+                                setJadeAuth({ authorization: pl.Authorization, apiKey: pl['X-Api-Key'] }, 'socket');
                             }
                         }
                     } catch (e) { /* noop */ }
@@ -1009,6 +1239,7 @@
                 },
                 body: JSON.stringify({ operationName: 'matchRouteInfo', variables: { id: matchId }, query: ROUTE_QUERY }),
             });
+            if (res.status === 401) refreshFromStorage();
             let j = null;
             try { j = await res.json(); } catch (e) { /* non-JSON error page */ }
             if (j) onRoute(j);
@@ -1051,6 +1282,7 @@
                 },
                 body: JSON.stringify({ operationName: 'prematch', variables: { id: matchId }, query: PREMATCH_QUERY }),
             });
+            if (res.status === 401) { refreshFromStorage(); return; }
             const j = await res.json();
             const m = j && j.data && j.data.match;
             if (!m || !Array.isArray(m.maps)) return;
@@ -1076,7 +1308,7 @@
         confirm: ['jadeUpdateTraderInputCsgoConfirmScore', 'CsgoConfirmScoreTraderInput', 'updateTraderInputCsgoConfirmScore'],
     };
 
-    async function mutate(kind, input) {
+    async function mutate(kind, input, retried) {
         const [op, type, field] = Q[kind];
         const query = `mutation ${op}($input: ${type}!) {\n  ${field}(input: $input) {\n    success\n    error\n    __typename\n  }\n}`;
         const res = await origFetch.call(W, L.jadeUrl, {
@@ -1091,6 +1323,12 @@
             },
             body: JSON.stringify({ operationName: op, variables: { input }, query }),
         });
+        if (res.status === 401 || res.status === 403) {
+            if (!retried && refreshFromStorage()) return mutate(kind, input, true);
+            const e = new Error(`${kind}: HTTP ${res.status}`);
+            e.auth = true;
+            throw e;
+        }
         if (!res.ok) throw new Error(`${kind}: HTTP ${res.status}`);
         const j = await res.json();
         if (j.errors && j.errors.length) throw new Error(`${kind}: ${j.errors[0].message}`);
@@ -1114,6 +1352,19 @@
                 await executeOne(a, mapId);
             } catch (e) {
                 const msg = (e && e.message) || String(e);
+                if (e && e.auth) {
+                    // Not sent: undo its latch so it goes again with new credentials.
+                    if (a.op === 'start') delete ST.start[a.round];
+                    if (a.op === 'plant') delete ST.plant[a.round];
+                    if (a.op === 'result') { delete ST.result[a.round]; delete ST.pmGuess[a.round]; if (a.bbRound !== undefined) delete ST.bbDone[a.bbRound]; }
+                    if (a.op === 'death') { delete ST.pending[a.side]; delete ST.autoClose[a.round]; if (a.bbRound !== undefined) delete ST.bbDone[a.bbRound]; }
+                    if (a.op === 'confirm') delete ST.confirm[a.key];
+                    if (!L.authWait) {
+                        L.authWait = Date.now();
+                        logLine(`Raiden refused the credentials (${msg.split(': ').pop()}) — waiting for the page's new ones`, 'warn');
+                    }
+                    return;
+                }
                 if (!NOT_LIVE_RE.test(msg)) throw e;
                 // Stops deaths and plants for the round, NOT the result: a
                 // refused death is no proof Raiden closed the round.
@@ -1153,9 +1404,9 @@
                 if (a.bbRound !== undefined) ST.bbDone[a.bbRound] = now;
                 if (!L.rd || L.rd.round !== a.round) { ST.result[a.round] = now; return; }
                 ST.result[a.round] = now;
-                if (a.source === 'pm') ST.pmGuess[a.round] = a.type;
+                if (a.source === 'pm' || a.source === 'cb') ST.pmGuess[a.round] = a.type;
                 await mutate('result', { mapId, type: a.type });
-                logLine(`R${a.round} result ${a.type}${a.source === 'pm' ? ' (Polymarket)' : ''}`, 'result');
+                logLine(`R${a.round} result ${a.type}${a.source === 'pm' ? ' (Polymarket)' : a.source === 'cb' ? ' (Cross.bet)' : ''}`, 'result');
             } else if (a.op === 'confirm') {
                 ST.confirm[a.key] = now;
                 await mutate('confirm', { mapId });
@@ -1201,6 +1452,12 @@
         }
         if (!here) return;
         const now = Date.now();
+        // Look for the page's renewed token every 30s (every 5s while an input
+        // is waiting for one).
+        if (L.auth && now - (L.authCheck || 0) > (L.authWait ? 5000 : 30000)) {
+            L.authCheck = now;
+            refreshFromStorage();          // adopts a newer token of the same kind, if the page has one
+        }
         // Events (Raiden's clean data every second while a round runs, every
         // betboom frame) are never throttled, unlike timers. Riding them keeps
         // Polymarket polled even in a background tab. pollPmLink dedupes.
@@ -1230,8 +1487,10 @@
             mapping: mappingFor(L.bb, route), raidenMapOrder: mapOrder, opts: OPTS,
             relaxed: ENV.test && OPTS.relaxed,
             pm: L.pm ? { at: L.pmAt, snap: L.pm, wins: L.pmWins } : null,
+            cb: cbSource(),
             rt: rt || null,
             rdMapName,
+            authWaitMs: L.authWait ? now - L.authWait : 0,
             // 1.x panels used this id; if one is on the page, the old script
             // is still installed and would send inputs alongside this one.
             oldLink: !!document.getElementById('dl-root'),
@@ -1272,6 +1531,7 @@
                 bb: L.bb && { matchId: L.bb.matchId, mapNum: L.bb.mapNum, mapName: L.bb.mapName, phase: L.bb.phase, total: L.bb.total,
                     teams: L.bb.teams, history: L.bb.history, unexplained: L.bb.unexplained, age: Math.round((now - (L.bb.lastUpdate || now)) / 1000) },
                 pm: L.pm && L.pm.map ? { map: L.pm.map, age: Math.round((now - L.pmAt) / 1000), via: L.pm.via } : null,
+                cb: L.cb ? { home: L.cb.home, away: L.cb.away, score: [L.cb.homeScore, L.cb.awayScore], map: L.cb.mapNum, age: Math.round((now - L.cbAt) / 1000), alive: L.cb.alive } : null,
             });
             if (L.trace.length > 1500) L.trace.shift();
         }
@@ -1346,7 +1606,7 @@
     }
 
     // Only suspends, never reopens: reopening stays with the trader (Shift+Space).
-    async function suspendMarkets(a) {
+    async function suspendMarkets(a, retried) {
         L.suspended[a.key] = Date.now();
         const op = 'jadeUpdateMapWithMatchMarketsState';
         try {
@@ -1366,6 +1626,7 @@
                     query: 'mutation jadeUpdateMapWithMatchMarketsState($input: MapMarketsStateUpdateInput!) {\n  updateMapWithMatchMarketsState(input: $input)\n}',
                 }),
             });
+            if ((res.status === 401 || res.status === 403) && !retried && refreshFromStorage()) return suspendMarkets(a, true);
             const j = await res.json();
             if (j && j.data && j.data.updateMapWithMatchMarketsState === 'SUSPENDED') logLine('markets SUSPENDED', 'error');
             else logLine('could not suspend markets: ' + ((j && j.errors && j.errors[0] && j.errors[0].message) || 'HTTP ' + res.status), 'error');
@@ -1431,6 +1692,7 @@
             raidenTeams: L.routes[route.matchId] || null, prematch: L.prematch[route.matchId] || null,
             raiden: L.rd, betboom: L.bb, betboomTabs: Object.keys(L.bbTabs).length,
             polymarket: { link: getPmLink(), snapshot: L.pm, wins: L.pmWins }, // eslint-disable-line no-use-before-define
+            crossbet: { pin: getCbLink(), pairing: GM_getValue(cbPairKey(), null), snapshot: L.cb, wins: L.cbWins }, // eslint-disable-line no-use-before-define
             alerts: L.alerts, suspended: L.suspended,
             state: ST, lastDecision: L.last,
             log: L.log.map(l => ({ t: l.t.toISOString(), kind: l.kind, msg: l.msg })),
@@ -1456,6 +1718,7 @@
     function setArmed(on) {
         L.armed = !!on;
         L.armedAt = Date.now();
+        L.authWait = 0;      // switching off and on retries, even with the same credentials
         // The switch click is a user gesture: the only moment a page may start
         // audio, so the alert sound's context is created (or resumed) here.
         try {
@@ -1542,6 +1805,64 @@
         dirty = true;
         tick();
     }
+
+    // ---- Cross.bet source ----------------------------------------------------
+    // Pinned per Raiden match by pasting the cross.bet match link (only that
+    // match is then accepted); without a pin, the latest open cross.bet match
+    // page is used and the panel says which. Teams pair by name with Raiden,
+    // or by hand in Setup (cross.bet names can be transliterations).
+    const cbLinkKey = () => `onak:cblink:${ENV.name}:${currentRoute().matchNum || '?'}`;
+    const cbPairKey = () => `onak:cbpair:${ENV.name}:${currentRoute().matchNum || '?'}`;
+    const getCbLink = () => GM_getValue(cbLinkKey(), null);
+    function cbSource() {
+        const v = L.cb;
+        if (!v || typeof v.homeScore !== 'number') return null;
+        return {
+            at: L.cbAt, alive: v.alive !== false, wins: L.cbWins,
+            pairing: GM_getValue(cbPairKey(), null),
+            snap: { via: 'tab', map: { seq: v.mapNum, teams: [
+                { name: 'home', label: v.home || 'home', score: v.homeScore },
+                { name: 'away', label: v.away || 'away', score: v.awayScore }] } },
+        };
+    }
+    function setCbLink(text) {
+        const t = String(text || '').trim();
+        const id = (t.match(/\/match\/(\d+)/) || t.match(/^(\d{6,})$/) || [])[1] || null;
+        if (t && !id) { logLine('not a cross.bet match link', 'warn'); return; }
+        GM_setValue(cbLinkKey(), id ? { url: t, id } : null);
+        L.cb = null; L.cbLast = null; L.cbWins = [];
+        logLine(id ? `Cross.bet pinned: match ${id}` : 'Cross.bet pin cleared — using any open cross.bet match', 'pm');
+        dirty = true;
+    }
+    function onCB(v) {
+        if (!v || !v.matchId) return;
+        const pin = getCbLink();
+        if (pin && pin.id !== v.matchId) return;
+        L.cbAt = v.at || Date.now();
+        // Wins: exactly one side +1 on the same match and map, as with Polymarket.
+        if (typeof v.homeScore === 'number' && typeof v.awayScore === 'number') {
+            const key = `${v.matchId}:${v.mapNum}`;
+            const prev = L.cbLast && L.cbLast.key === key ? L.cbLast : null;
+            if (prev && (prev.h !== v.homeScore || prev.a !== v.awayScore)) {
+                const dh = v.homeScore - prev.h, da = v.awayScore - prev.a;
+                if ((dh === 1 && da === 0) || (dh === 0 && da === 1)) {
+                    const winner = dh === 1 ? 'home' : 'away';
+                    const round = v.homeScore + v.awayScore;
+                    L.cbWins.push({ map: v.mapNum, round, winner, scores: { home: v.homeScore, away: v.awayScore }, at: Date.now() });
+                    if (L.cbWins.length > 40) L.cbWins.shift();
+                    logLine(`Cross.bet: ${(winner === 'home' ? v.home : v.away) || winner} takes round ${round} (${v.homeScore}-${v.awayScore})`, 'pm');
+                }
+            }
+            L.cbLast = { key, h: v.homeScore, a: v.awayScore };
+        }
+        L.cb = v;
+        dirty = true;
+        tick();
+    }
+    try {
+        onCB(GM_getValue('onak:cb', null));
+        GM_addValueChangeListener('onak:cb', (k, o, v) => onCB(v));
+    } catch (e) { /* noop */ }
 
     // ---- Polymarket source --------------------------------------------------
     // With a link set for this Raiden match, Onak asks Polymarket itself
@@ -1898,8 +2219,9 @@
             ['result', 'Round end', 'Closes the round with its type'],
             ['confirm', 'Confirm score', 'Confirms the point Onak just set'],
         ]],
-        ['SOURCES', '', [
+        ['SOURCES', 'the first to score closes the round', [
             ['pm', 'Polymarket score', 'Closes the round as soon as Polymarket scores it'],
+            ['cb', 'Cross.bet score', 'Same, from an open cross.bet match tab'],
         ]],
         ['SAFETY', '', [
             ['suspend', 'Auto-suspend', 'Suspends on wrong map, sides or score; never reopens'],
@@ -1946,7 +2268,8 @@
         else if (L.error) { status.className = 'err'; status.textContent = 'ERROR · ' + L.error; }
         else if (res.hold) {
             status.className = 'hold';
-            status.textContent = 'HOLD · ' + res.hold + (OPTS.pm && L.pm ? ' · Polymarket still closes rounds' : '');
+            const srcOn = (OPTS.pm && L.pm) || (OPTS.cb && L.cb);
+            status.textContent = 'HOLD · ' + res.hold + (srcOn ? ' · score sources still close rounds' : '');
         }
         else { status.className = 'ok'; status.textContent = 'ACTIVE · ' + (res.info[0] || 'in sync'); }
 
@@ -2022,7 +2345,8 @@
         if (bb && bb.teams && bb.teams.length) {
             const quiet = bb.lastUpdate ? Math.round((now - bb.lastUpdate) / 1000) : null;
             line(`bb map ${bb.mapNum || '?'} · R${bbRoundOf(bb)} · ${bb.phase || '—'}` + (L.bbOpen > 1 ? ` · ${L.bbOpen} bb tabs` : ''),
-                `${bb.latency ? bb.latency.toFixed(1) + 's' : ''}${quiet !== null && quiet >= 5 ? ` · quiet ${quiet}s` : ''}`);
+                `${bb.latency ? bb.latency.toFixed(1) + 's' : ''}${quiet !== null && quiet >= 5 ? ` · quiet ${quiet}s` : ''}`,
+                bb.latency > LAG_ON ? 'dl-bad' : '');
         } else line('bb —', '');
         // Map check, always on screen: Raiden's prematch name for the map open
         // here vs betboom's live map, so a later override can be eyeballed.
@@ -2036,6 +2360,12 @@
             mapMark = ok ? '✓' : '✗ mismatch'; mapCls = ok ? 'dl-good' : 'dl-bad';
         }
         line(`map ${rdOrder || '?'} · Raiden ${rdName || '?'} · bb ${bbName ? (bb.mapNum ? bb.mapNum + ' ' : '') + bbName : '?'}`, mapMark, mapCls);
+        if (OPTS.cb && L.cb) {
+            const age = Math.round((now - L.cbAt) / 1000);
+            const c = L.cb;
+            line(`CB map ${c.mapNum || '?'} · ${c.home || 'home'} ${c.homeScore ?? '·'} – ${c.away || 'away'} ${c.awayScore ?? '·'}`,
+                c.alive === false ? 'socket closed' : `${age}s`, (age > 5 || c.alive === false) ? 'dl-bad' : '');
+        }
         if (!OPTS.pm) line('Polymarket off', '');
         else if (L.pm && L.pm.map) {
             const age = Math.round((now - L.pmAt) / 1000);
@@ -2142,6 +2472,58 @@
                 row.appendChild(clr);
             }
             box.appendChild(row);
+        });
+
+        const cbBox = section(setup, 'cbsrc');
+        const cbLink = getCbLink();
+        const cbPair = GM_getValue(cbPairKey(), null) || {};
+        const cbSig = JSON.stringify([OPTS.cb, cbLink, L.cb && [L.cb.matchId, L.cb.home, L.cb.away], cbPair, rt && [rt.home.name, rt.away.name]]);
+        rebuildIf(cbBox, cbSig, box => {
+            box.appendChild(el('div', 'dl-sec', 'CROSS.BET SOURCE'));
+            if (!OPTS.cb) { box.appendChild(el('div', 'dl-note', 'Cross.bet score is off (Options).')); return; }
+            const src = el('div', 'dl-src');
+            if (L.cb) {
+                src.append(el('b', '', cbLink ? 'pinned' : 'open tab'), ' · ');
+                const a = el('a', '', `${L.cb.home || 'home'} vs ${L.cb.away || 'away'}`);
+                a.href = L.cb.url || '#'; a.target = '_blank'; a.rel = 'noopener';
+                a.title = 'match ' + L.cb.matchId;
+                src.appendChild(a);
+            } else src.textContent = cbLink ? `pinned to match ${cbLink.id} — open that cross.bet page` : 'none — open the cross.bet match page';
+            box.appendChild(src);
+            const row = el('div', 'dl-link');
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.placeholder = 'cross.bet/match/… link (pins the match)';
+            inp.value = cbLink ? cbLink.url : '';
+            const save = el('button', '', cbLink ? 'Save' : 'Pin');
+            save.addEventListener('click', () => { setCbLink(inp.value); inp.blur(); });
+            inp.addEventListener('keydown', e => { if (e.key === 'Enter') { setCbLink(inp.value); inp.blur(); } });
+            row.append(inp, save);
+            if (cbLink) {
+                const clr = el('button', '', '×');
+                clr.title = 'Unpin (use any open cross.bet match)';
+                clr.addEventListener('click', () => setCbLink(''));
+                row.appendChild(clr);
+            }
+            box.appendChild(row);
+            // Pairing: cross.bet only says home/away; names may not match Raiden's.
+            if (L.cb && rt) {
+                const pr = el('div', 'dl-map');
+                pr.style.marginTop = '5px';
+                pr.appendChild(el('span', '', `CB home (${L.cb.home || '?'}) is`));
+                const sel = document.createElement('select');
+                const auto = el('option', '', 'auto (by name)'); auto.value = '';
+                const oh = el('option', '', rt.home.name); oh.value = 'home';
+                const oa = el('option', '', rt.away.name); oa.value = 'away';
+                sel.append(auto, oh, oa);
+                sel.value = cbPair.home || '';
+                sel.addEventListener('change', () => {
+                    GM_setValue(cbPairKey(), sel.value ? { home: sel.value, away: sel.value === 'home' ? 'away' : 'home' } : null);
+                    sel.blur(); dirty = true; tick();
+                });
+                pr.appendChild(sel);
+                box.appendChild(pr);
+            }
         });
 
         // ================= OPTIONS =================
