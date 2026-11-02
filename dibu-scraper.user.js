@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.11.3
+// @version      1.12.4
 // @description  bb scraper
-// @icon         https://betboom.ru/favicon.ico
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=oddin.gg
 // @author       GG
 // @match        https://betboom.ru/esport/*
 // @match        https://betboom.ru/sport/*
@@ -284,6 +284,15 @@
         soundReady: false,
         lastResub: 0,
         seriesSock: null, lastSeriesOpen: 0, seriesStatus: 'idle', seriesDelay: null,
+        vetoSock: null, lastVetoOpen: 0, vetoStatus: 'idle', vetoDelay: null, vetoBare: false, vetoLive: false, vetoForm: null, probing: false,
+        seriesByMatch: new Map(),       // betboom match id -> GRID series id (from match details)
+        oddinByMatch: new Map(),        // betboom match id -> Oddin match id (= the Raiden match number)
+        detailsAsked: new Map(),        // betboom match id -> last time the Dibu asked for its details
+        seriesHinted: new Set(),        // betboom match ids whose series id came from Onak (Polymarket)
+        seriesSrc: new Map(),           // betboom match id -> 'betboom' | 'manual' | 'Onak'
+        manualNote: '',
+        vetoes: {},                     // GRID series id -> { steps, saved, loaded }
+        liveLog: {},                    // GRID series id -> { ids, rows } (Live log tab)
         logTab: 'cur',
         flip: store('flip') || {},
         rx: { tree: 0, grid: 0, bad: 0, sockets: 0 },
@@ -318,6 +327,151 @@
     // =====================================================================
 
     const OrigWS = PAGE.WebSocket;
+
+    // The GRID series id also comes in betboom's match details (live_stat_url
+    // ...&match_id=<series>), which the page asks for on load. The game feed
+    // only carries it once a map is live, so between maps or before the match
+    // the veto and the probe had no series to ask for.
+    function noteSeriesFromDetails(reqBody, json) {
+        try {
+            const req = typeof reqBody === 'string' ? JSON.parse(reqBody) : reqBody;
+            const bbId = req && (req.match_id || (req.data && req.data.match_id));
+            const url = json && (json.live_stat_url || (json.data && json.data.live_stat_url));
+            const sid = url && (/[?&]match_id=(\d+)/.exec(url) || [])[1];
+            if (bbId && sid) { S.seriesByMatch.set(String(bbId), sid); S.seriesSrc.set(String(bbId), 'betboom'); S.seriesHinted.delete(String(bbId)); S.dirty = true; }
+            // betboom's stats widget is Oddin's: its stat_url carries the Oddin
+            // match id (id=base64("match/od:match:<n>")), the same number as the
+            // match in Raiden. Handed to Onak to know the tab is the right match.
+            const stat = json && (json.stat_url || (json.data && json.data.stat_url));
+            const idParam = stat && (/[?&]id=([^&]+)/.exec(stat) || [])[1];
+            if (bbId && idParam) {
+                const dec = atob(decodeURIComponent(idParam));
+                const n = (/od:match:(\d+)/.exec(dec) || [])[1];
+                if (n) { S.oddinByMatch.set(String(bbId), n); S.dirty = true; }
+            }
+        } catch (e) { /* not that response */ }
+    }
+    if (typeof PAGE.fetch === 'function') {
+        const origFetch = PAGE.fetch;
+        PAGE.fetch = function (input, init) {
+            const p = origFetch.apply(this, arguments);
+            try {
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+                if (/get_match_details_info/.test(url)) {
+                    const body = init && init.body;
+                    p.then(r => r.clone().json()).then(j => noteSeriesFromDetails(body, j)).catch(() => {});
+                }
+            } catch (e) { /* never break the page */ }
+            return p;
+        };
+    }
+    // The page only asks for the details of the match in its URL. For the
+    // match open in the Dibu (picked from the list, or before the match goes
+    // live) the Dibu asks itself - the same request the page makes when a
+    // match is opened - once a minute until the series id is known.
+    const DETAILS_URL = 'https://siteapi.betboom.ru/api/site_api/v1/sporthub/tree/get_match_details_info';
+    function requestDetails(force) {
+        const id = S.active;
+        if (!id || (!force && S.seriesByMatch.has(String(id)) && S.seriesSrc.get(String(id)) === 'betboom')) return;
+        if (!force && S.seriesByMatch.has(String(id))) return;
+        const last = S.detailsAsked.get(String(id)) || 0;
+        if (Date.now() - last < 60000) return;
+        S.detailsAsked.set(String(id), Date.now());
+        try {
+            PAGE.fetch(DETAILS_URL, {
+                method: 'POST', credentials: 'include',
+                headers: { accept: 'application/json', 'content-type': 'application/json', 'x-platform': 'web' },
+                body: JSON.stringify({ match_id: Number(id), language: 'LANGUAGES_RU', theme: 'THEMES_BLACK' }),
+            }).catch(() => { /* next minute */ });
+        } catch (e) { /* next minute */ }
+    }
+
+    // Onak can know the series id before betboom does: from the Polymarket
+    // link set on the Raiden match. It sends it only for betboom matches it
+    // has paired with that Raiden match (Oddin id, or team names).
+    window.addEventListener('message', ev => {
+        const d = ev.data;
+        if (!d || d.tag !== 'onak-hint:v1' || ev.origin !== location.origin || !d.hints) return;
+        Object.keys(d.hints).forEach(bb => {
+            if (!S.seriesByMatch.has(String(bb)) && /^\d+$/.test(String(d.hints[bb]))) {
+                S.seriesByMatch.set(String(bb), String(d.hints[bb]));
+                S.seriesSrc.set(String(bb), 'Onak');
+                S.seriesHinted.add(String(bb));
+                S.dirty = true;
+            }
+        });
+    });
+
+    // Series id set by hand in the Veto card: the GRID series id itself, or a
+    // Polymarket event link (its gridSeriesId is looked up). Kept per betboom
+    // match for 36h, then forgotten.
+    const MANUAL_KEY = 'dibu_series_manual';
+    const MANUAL_TTL = 36 * 3600 * 1000;
+    function manualAll() {
+        let all = {};
+        try { all = JSON.parse(localStorage.getItem(MANUAL_KEY) || '{}') || {}; } catch (e) { all = {}; }
+        let changed = false;
+        Object.keys(all).forEach(k => { if (!all[k] || Date.now() - all[k].at > MANUAL_TTL) { delete all[k]; changed = true; } });
+        if (changed) try { localStorage.setItem(MANUAL_KEY, JSON.stringify(all)); } catch (e) { /* noop */ }
+        return all;
+    }
+    function manualLoad() {
+        const all = manualAll();
+        Object.keys(all).forEach(bb => {
+            if (!S.seriesByMatch.has(bb)) { S.seriesByMatch.set(bb, all[bb].sid); S.seriesSrc.set(bb, 'manual'); }
+        });
+    }
+    function setManualSeries(text) {
+        const bb = S.active ? String(S.active) : null;
+        const note = msg => { S.manualNote = msg; S.dirty = true; };
+        if (!bb) return note('open a match first');
+        const t = String(text || '').trim();
+        const apply = (sid, src) => {
+            const all = manualAll();
+            all[bb] = { sid, at: Date.now(), src };
+            try { localStorage.setItem(MANUAL_KEY, JSON.stringify(all)); } catch (e) { /* noop */ }
+            S.seriesByMatch.set(bb, sid); S.seriesSrc.set(bb, 'manual');
+            note(`series ${sid} set by hand`);
+            refreshNow();
+        };
+        if (!t) {                                           // empty: forget the manual id
+            const all = manualAll(); delete all[bb];
+            try { localStorage.setItem(MANUAL_KEY, JSON.stringify(all)); } catch (e) { /* noop */ }
+            if (S.seriesSrc.get(bb) === 'manual') { S.seriesByMatch.delete(bb); S.seriesSrc.delete(bb); }
+            return note('manual series cleared');
+        }
+        if (/^\d{5,}$/.test(t)) return apply(t, 'id');
+        const slug = (/polymarket\.com\/(?:[a-z]{2}\/)?(?:event|esports)\/(?:[^?#]*\/)?([^/?#]+)/i.exec(t) || [])[1];
+        if (!slug) return note('paste a GRID series id or a Polymarket event link');
+        note('reading the Polymarket link…');
+        fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`)
+            .then(r => r.json())
+            .then(j => {
+                const ev = Array.isArray(j) ? j[0] : j;
+                const sid = ev && ev.eventMetadata && ev.eventMetadata.gridSeriesId;
+                if (sid) apply(String(sid), 'polymarket');
+                else note('that Polymarket event has no GRID series');
+            })
+            .catch(() => note('could not read the link from here — paste the series id (the Polymarket scraper shows it)'));
+    }
+    // ↻ in the Veto card: ask betboom for the details again and reopen the
+    // live-log and stats sockets now, instead of waiting for the next retry.
+    function refreshNow() {
+        if (S.active) S.detailsAsked.delete(String(S.active));
+        requestDetails(true);
+        if (S.vetoSock) { try { S.vetoSock.ws.close(); } catch (e) { /* gone */ } S.vetoSock = null; }
+        S.lastVetoOpen = 0; S.vetoBare = false; S.vetoStatus = 'idle';
+        if (S.seriesSock) { try { S.seriesSock.ws.close(); } catch (e) { /* gone */ } S.seriesSock = null; }
+        S.lastSeriesOpen = 0;
+        S.lastResub = 0;
+        ensureVetoSocket(); ensureSeriesSocket();
+        S.dirty = true;
+    }
+
+    const activeSeries = () => {
+        const g = S.active ? S.games.get(S.active) : null;
+        return (g && g.seriesId) || (S.active ? S.seriesByMatch.get(String(S.active)) : null) || null;
+    };
 
     function sendSub(sock, matchId) {
         try { sock.send(encodeGridSub(randomSubId(), matchId)); return true; }
@@ -1173,7 +1327,14 @@
 
     function linkSnapshot() {
         const g = S.active ? S.games.get(S.active) : null;
-        if (!g) return { matchId: S.active || null, teams: [] };
+        const sidNow = activeSeries();
+        const vetoNow = { seriesId: sidNow, status: S.vetoStatus, delay: S.vetoDelay, steps: (vetoOf(sidNow) || { steps: [] }).steps };
+        // Between maps or before the match there is no game yet, but the veto
+        // (and its series) can already be there.
+        const oddinMatchId = S.active ? (S.oddinByMatch.get(String(S.active)) || null) : null;
+        const mm = S.active ? S.matches.get(S.active) : null;
+        const metaTeams = mm && mm.home && mm.away ? [mm.home.name, mm.away.name] : [];
+        if (!g) return { matchId: S.active || null, oddinMatchId, metaTeams, teams: [], veto: vetoNow };
         auditDeaths(g, null);          // let pending drops time out between frames
         // The LIVE map, never the one selected in the HUD: browsing an old map
         // must not change what Raiden is fed.
@@ -1212,6 +1373,10 @@
                 nick: u.nick, team: u.team, teamId: u.teamId, round: u.round, at: u.at,
             })) : [],
             lastUpdate: g.lastUpdate, latency: latencyOf(g.matchId),
+            // The veto as read from GRID's live log through betboom's proxy.
+            veto: vetoNow,
+            oddinMatchId,
+            metaTeams,
         };
     }
 
@@ -1313,6 +1478,10 @@
     // re-assert the subscription whenever the feed is quiet — a fresh snapshot
     // is exactly what we want anyway.
     const STALE_MS = 20000;
+    // Re-subscribe the open match this often while it sends nothing. Between
+    // maps the feed is silent and the next map is only picked up on a resub;
+    // at 20s that added up to 20s (10 on average) once the map started.
+    const RESUB_MS = 5000;
 
     // A pin taken from the URL is only a guess about which path segment holds
     // the match id. If the tree feed lists every live match and ours is not
@@ -1354,8 +1523,12 @@
     const GRID_SB_RETRY = 15000;
 
     function gridScoreboardUrl(seriesId) {
+        // delay=zero, as betboom's own page asks since 2 Nov: GRID then declares
+        // 8s for this service; without it, 180s (both measured by the probe).
+        // team_scoreboard: K/D/A, money (CR), value (NW) and items per player.
+        // series_table: per-map (Game) and series K/A/D with headshots.
         return `${GRID_SB_HOST}/widgets-v2/live/${encodeURIComponent(seriesId)}` +
-            '?events=team_scoreboard&isCompressionEnabled=true';
+            '?delay=zero&events=team_scoreboard,series_table&isCompressionEnabled=true';
     }
 
     function ensureSeriesSocket() {
@@ -1406,16 +1579,288 @@
             let env;
             try { env = JSON.parse(ev.data); } catch (e) { return; }
             if (!env || typeof env.service !== 'string' || !Array.isArray(env.data)) return;
-            if (env.service.indexOf('team_scoreboard') === -1) return;
+            const isTable = env.service.indexOf('series_table') >= 0;
+            if (env.service.indexOf('team_scoreboard') === -1 && !isTable) return;
             if (typeof env.delay === 'number') S.seriesDelay = env.delay;
             env.data.forEach(item => {
                 unpackGrid(item)
-                    .then(obj => applySeriesScoreboard(want, obj))
+                    .then(obj => (isTable ? applySeriesTable(want, obj) : applySeriesScoreboard(want, obj)))
                     .catch(() => {
                         if (S.seriesSock && S.seriesSock.ws === ws) S.seriesStatus = 'unreadable';
                     });
             });
         });
+    }
+
+    // ---------- GRID veto (live log) through betboom's proxy ----------
+    // The veto (bans, picks, side choices) is in GRID's live log. It is asked
+    // of the same proxy betboom already uses (grid.sporthub.bet), on a second
+    // socket so the scoreboard socket is untouched if the proxy refuses this
+    // service. Nothing reaches GRID from here: the proxy is betboom's. The
+    // backlog arrives on connect, so a late connection still gets the veto.
+    // Experimental (1.11.4): whether the proxy serves live_log is what this
+    // tests; its state shows on the GRID dot's tooltip.
+    // The veto never changes once made: it is kept per series in betboom's
+    // storage (shown at once after a reload), and once the decider is in the
+    // socket is closed and not opened again.
+    const vetoStoreKey = id => 'dibu_veto_' + id;
+    // Kept per GRID series (not per game object, which does not exist between
+    // maps or before the match).
+    function vetoOf(sid) {
+        if (!sid) return null;
+        let v = S.vetoes[sid];
+        if (!v) {
+            v = S.vetoes[sid] = { steps: [], saved: false };
+            try {
+                const st = JSON.parse(localStorage.getItem(vetoStoreKey(sid)) || 'null');
+                if (Array.isArray(st) && st.length) { v.steps = st; v.saved = true; S.dirty = true; }
+            } catch (e) { /* storage blocked */ }
+        }
+        return v;
+    }
+    function vetoSave(sid) {
+        try { localStorage.setItem(vetoStoreKey(sid), JSON.stringify(S.vetoes[sid].steps)); } catch (e) { /* storage blocked */ }
+    }
+    const vetoDone = sid => { const v = vetoOf(sid); return !!(v && v.steps.some(x => x.action === 'decider')); };
+
+    function ensureVetoSocket() {
+        // 1.12.0: this socket also feeds the Live log tab, so it stays open for
+        // the match on screen even once the veto is complete (the veto itself
+        // is still read once and kept per series).
+        const want = activeSeries();
+        vetoOf(want);
+        const vs = S.vetoSock;
+        if (vs && vs.seriesId !== want) {
+            try { vs.ws.close(); } catch (e) { /* gone */ }
+            S.vetoSock = null; S.lastVetoOpen = 0; S.vetoStatus = 'idle';
+        }
+        if (!want) return;
+        if (S.vetoSock && (S.vetoSock.ws.readyState === 0 || S.vetoSock.ws.readyState === 1)) return;
+        if (Date.now() - S.lastVetoOpen < (S.vetoStatus === 'refused' ? 120000 : GRID_SB_RETRY)) return;
+        S.lastVetoOpen = Date.now();
+        let ws, opened = false;
+        // Polymarket asks GRID with delay=zero since 2 Nov; whether betboom's
+        // proxy wants it is unknown, so a refused attempt flips to the other form.
+        const qs = S.vetoBare ? 'events=live_log&isCompressionEnabled=true' : 'delay=zero&events=live_log&isCompressionEnabled=true';
+        try {
+            ws = new OrigWS(`${GRID_SB_HOST}/widgets-v2/live/${encodeURIComponent(want)}?${qs}`);
+        } catch (e) { S.vetoStatus = 'error'; return; }
+        S.vetoSock = { ws, seriesId: want };
+        S.vetoStatus = 'connecting';
+        ws.addEventListener('open', () => { opened = true; S.vetoStatus = 'open'; S.dirty = true; });
+        ws.addEventListener('close', () => {
+            if (!S.vetoSock || S.vetoSock.ws !== ws) return;
+            S.vetoSock = null;
+            S.vetoStatus = opened ? 'closed' : 'refused';
+            if (!S.vetoLive) S.vetoBare = !S.vetoBare;               // try the other form next time
+            S.dirty = true;
+        });
+        ws.addEventListener('message', ev => {
+            if (typeof ev.data !== 'string') return;
+            let env;
+            try { env = JSON.parse(ev.data); } catch (e) { return; }
+            if (!env || typeof env.service !== 'string' || !/live_log$/.test(env.service) || !Array.isArray(env.data)) return;
+            S.vetoStatus = 'live';
+            S.vetoLive = true;
+            S.vetoForm = /delay=zero/.test(qs) ? 'delay=zero' : 'no delay param';
+            if (typeof env.delay === 'number') S.vetoDelay = env.delay;
+            env.data.forEach(item => {
+                unpackGrid(item).then(obj => {
+                    const e = obj && obj.body && obj.body.entryToAdd;
+                    if (e) addLiveLog(want, e);
+                    const v = e && parseVeto(e);
+                    if (!v) return;
+                    const vs = vetoOf(want);
+                    if (vs.steps.some(x => x.id === v.id)) return;
+                    vs.steps.push(v);
+                    vs.steps.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+                    vs.saved = false;
+                    vetoSave(want);
+                    S.dirty = true;
+                }).catch(() => { /* unreadable item */ });
+            });
+        });
+    }
+
+    // ---------- GRID live log (all of it) ----------
+    // Every kill (no one-kill-per-frame loss), bomb events, round wins,
+    // pauses and timeouts, as GRID writes them, ~8s declared delay. Shown in
+    // the "Live log" tab; nothing else depends on it yet.
+    const LIVELOG_MAX = 1500;
+    function addLiveLog(sid, e) {
+        if (!sid || !e || !e.id) return;
+        const L = S.liveLog[sid] || (S.liveLog[sid] = { ids: new Set(), rows: [] });
+        if (L.ids.has(e.id)) return;
+        const chunks = (e.sentenceChunks || []).map(c => ({ text: String(c.text || ''), color: c.color || '' }));
+        const text = chunks.map(c => c.text).join(' ');
+        if (/^Game set GameClock$/.test(text)) return;          // clock bookkeeping, noise
+        L.ids.add(e.id);
+        L.rows.push({ id: e.id, ts: e.timestamp || '', gameTime: e.gameTime || '', cat: e.eventCategory || '', chunks, text });
+        if (L.rows.length > LIVELOG_MAX * 1.2) {
+            L.rows.sort((a, b) => a.ts.localeCompare(b.ts));
+            L.rows.splice(0, L.rows.length - LIVELOG_MAX);
+            L.ids = new Set(L.rows.map(r => r.id));
+        }
+        L.dirty = true;
+        S.dirty = true;
+    }
+
+    // ---------- GRID probe ----------
+    // Asks betboom's GRID proxy for each widget service, one socket at a time,
+    // in both forms (with and without delay=zero), for the match on screen.
+    // Each socket closes on its first message or after PROBE_WAIT_MS. Records:
+    // answered or not, the delay the envelope declares, the real age of the
+    // data where it carries a source time, item count and a decoded sample.
+    // Ends with a JSON download and a summary in the Veto card.
+    const PROBE_SERVICES = ['series_scoreboard_v2', 'live_log', 'team_scoreboard', 'series_map_schematic',
+        'series_map_schematic_v2', 'series_table', 'series_comparison', 'team_colors', 'series_scoreboard'];
+    const PROBE_FORMS = { zero: 'delay=zero&', bare: '' };
+    const PROBE_WAIT_MS = 6000;
+
+    // Newest source time found anywhere in a decoded payload (occurredAt,
+    // timestamp, updatedAt...), to compute how old the data really is.
+    function newestTime(obj) {
+        let best = 0;
+        const walk = (o, depth) => {
+            if (!o || depth > 7) return;
+            if (Array.isArray(o)) { o.forEach(x => walk(x, depth + 1)); return; }
+            if (typeof o !== 'object') return;
+            for (const k in o) {
+                const v = o[k];
+                if (typeof v === 'string' && /(At|timestamp|Time)$/i.test(k) && /^\d{4}-\d\d-\d\dT/.test(v)) {
+                    const t = Date.parse(v);
+                    if (t > best && t <= Date.now() + 60000) best = t;
+                } else if (v && typeof v === 'object') walk(v, depth + 1);
+            }
+        };
+        walk(obj, 0);
+        return best || null;
+    }
+
+    function probeOne(seriesId, service, form) {
+        return new Promise(resolve => {
+            const url = `${GRID_SB_HOST}/widgets-v2/live/${encodeURIComponent(seriesId)}?${PROBE_FORMS[form]}events=${service}&isCompressionEnabled=true`;
+            const r = { service, form: form === 'zero' ? 'delay=zero' : 'no delay param', opened: false, answered: false,
+                returnedService: null, declaredDelay: null, items: 0, realAgeS: null, closeCode: null, ms: null, sample: null, error: null };
+            const t0 = Date.now();
+            let ws, done = false;
+            const finish = () => {
+                if (done) return;
+                done = true;
+                try { ws.close(); } catch (e) { /* gone */ }
+                r.ms = Date.now() - t0;
+                resolve(r);
+            };
+            try { ws = new OrigWS(url); } catch (e) { r.error = String(e.message || e); resolve(r); return; }
+            const timer = setTimeout(finish, PROBE_WAIT_MS);
+            ws.addEventListener('open', () => { r.opened = true; });
+            ws.addEventListener('close', ev => { r.closeCode = ev.code; clearTimeout(timer); finish(); });
+            ws.addEventListener('message', ev => {
+                if (typeof ev.data !== 'string') return;
+                let env;
+                try { env = JSON.parse(ev.data); } catch (e) { return; }
+                r.answered = true;
+                r.returnedService = env.service || null;
+                r.declaredDelay = typeof env.delay === 'number' ? env.delay : null;
+                r.items = Array.isArray(env.data) ? env.data.length : 0;
+                const items = (env.data || []).slice(-3);
+                Promise.all(items.map(it => unpackGrid(it).catch(() => null))).then(objs => {
+                    const ok = objs.filter(Boolean);
+                    const newest = Math.max(0, ...ok.map(newestTime).filter(Boolean));
+                    if (newest) r.realAgeS = Math.round((Date.now() - newest) / 100) / 10;
+                    const smp = JSON.stringify(ok[ok.length - 1] || null);
+                    r.sample = smp && smp.length > 4000 ? smp.slice(0, 4000) + '…' : smp;
+                    clearTimeout(timer);
+                    finish();
+                });
+            });
+        });
+    }
+
+    async function gridProbe() {
+        const g = S.active ? S.games.get(S.active) : null;
+        const sid = activeSeries();
+        const box = root && root.querySelector('#mh-probe');
+        if (!sid) { if (box) box.textContent = 'probe: no series id for this match yet'; return; }
+        if (S.probing) return;
+        S.probing = true;
+        const results = [];
+        const all = [];
+        PROBE_SERVICES.forEach(svc => Object.keys(PROBE_FORMS).forEach(f => all.push([svc, f])));
+        for (let i = 0; i < all.length; i++) {
+            if (box) box.textContent = `probe ${i + 1}/${all.length}: ${all[i][0]} (${all[i][1] === 'zero' ? 'delay=zero' : 'plain'})…`;
+            results.push(await probeOne(sid, all[i][0], all[i][1]));
+        }
+        S.probing = false;
+        const meta = S.matches.get(S.active);
+        const dump = {
+            tool: 'dibu-grid-probe', version: VERSION, at: new Date().toISOString(), host: GRID_SB_HOST,
+            matchId: S.active, seriesId: sid, title: meta && meta.home && meta.away ? `${meta.home.name} vs ${meta.away.name}` : '',
+            phase: g ? g.phase : 'no game feed', feedLatencyS: g ? latencyOf(g.matchId) : null, results,
+        };
+        try {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([JSON.stringify(dump, null, 1)], { type: 'application/json' }));
+            a.download = `dibu-grid-probe-${sid}-${Date.now()}.json`;
+            document.body.appendChild(a); a.click(); a.remove();
+        } catch (e) { /* download blocked: the summary below still shows it */ }
+        if (box) {
+            box.textContent = '';
+            box.appendChild(el('div', 'pr-h', `probe ${new Date().toTimeString().slice(0, 5)} · JSON downloaded`));
+            PROBE_SERVICES.forEach(svc => {
+                const z = results.find(x => x.service === svc && x.form === 'delay=zero');
+                const b = results.find(x => x.service === svc && x.form === 'no delay param');
+                const cell = x => !x ? '?' : x.answered ? `${x.declaredDelay ?? '?'}s${x.realAgeS !== null ? ` (${x.realAgeS}s old)` : ''}${x.items ? ` ·${x.items}` : ''}` : (x.opened ? 'silent' : 'refused');
+                const row = el('div', 'pr-r');
+                row.append(el('span', 'pr-s', svc), el('span', z && z.answered ? 'pr-ok' : 'pr-no', cell(z)), el('span', b && b.answered ? 'pr-ok' : 'pr-no', cell(b)));
+                box.appendChild(row);
+            });
+            box.appendChild(el('div', 'pr-h', 'columns: delay=zero | plain · declared delay (real age) ·items'));
+        }
+    }
+
+    // Veto steps as text, one line per step, the way Onak's VETO tab shows
+    // them: "22:32 Parivision banned Nuke", "22:33 G2 Esports chose CT on Dust2".
+    function vetoText(steps) {
+        const verb = { ban: 'banned', pick: 'picked', decider: 'decider', side: 'chose' };
+        return steps.map(v => {
+            const t = v.ts ? new Date(v.ts).toTimeString().slice(0, 5) + ' ' : '';
+            return `${t}${v.team} ${verb[v.action] || v.action} ${v.action === 'side' ? `${v.side} on ${v.map}` : v.map}`;
+        }).join('\n');
+    }
+    function copyText(text) {
+        try { if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(text); return; } } catch (e) { /* fallback */ }
+        const ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } catch (e) { /* nothing more to try */ }
+        ta.remove();
+    }
+
+    // Live-log entry -> veto step. Entries are structured: team chunk (color
+    // "teams.<id>") or "Series", action (banned / picked / picked_side), then
+    // the map ("Map [Cache]") or the side ("Counter-Terrorists [Mirage]").
+    function parseVeto(e) {
+        const ch = e && e.sentenceChunks;
+        if (!ch || ch.length < 3) return null;
+        const key = c => (c && c.textTranslation && c.textTranslation.key) || '';
+        const act = key(ch[1]) || String(ch[1].text || '').toLowerCase().replace(/\s+/g, '_');
+        const team = String(ch[0].text || '').trim();
+        const series = key(ch[0]) === 'series' || /^series$/i.test(team);
+        const teamId = (/teams\.(\d+)/.exec(ch[0].color || '') || [])[1] || null;
+        const clean = v => String(v || '').replace(/^Map\s*/i, '').replace(/[[\]]/g, '').trim();
+        if (act === 'banned' || act === 'picked') {
+            const vars = ch[2].textTranslation && ch[2].textTranslation.variables;
+            return { id: e.id, ts: e.timestamp, team: series ? 'Series' : team, teamId,
+                action: act === 'banned' ? 'ban' : (series ? 'decider' : 'pick'), map: clean((vars && vars.map_name) || ch[2].text) };
+        }
+        if (act === 'picked_side') {
+            const m = /^(.*?)\s*\[(.+)\]\s*$/.exec(String(ch[2].text || ''));
+            if (!m) return null;
+            const raw = m[1].trim();
+            const side = /counter/i.test(raw) ? 'CT' : /^terror/i.test(raw) ? 'T' : /attack/i.test(raw) ? 'ATK' : /defen/i.test(raw) ? 'DEF' : raw;
+            return { id: e.id, ts: e.timestamp, team, teamId, action: 'side', side, map: m[2].trim() };
+        }
+        return null;
     }
 
     // Payloads arrive base64 over gzip. DecompressionStream is async, which is
@@ -1449,18 +1894,35 @@
         return null;
     }
 
+    // "4.9K" -> 4900, "0.1K" -> 100, "350" -> 350.
+    function moneyOf(v) {
+        const m = /^\s*\$?\s*([\d.]+)\s*([kKmM]?)\s*$/.exec(String(v == null ? '' : v));
+        if (!m) return null;
+        const n = parseFloat(m[1]);
+        return Math.round(n * (/k/i.test(m[2]) ? 1000 : /m/i.test(m[2]) ? 1e6 : 1));
+    }
+    const dpOf = (dps, label) => { const x = (dps || []).find(d => d && d.label === label); return x ? x.value : null; };
+
+    // team_scoreboard: this MAP's K/D/A (a probe at the start of map 3 read
+    // arT 0/1/0), plus money (CR), value (NW) and items per player.
     function applySeriesScoreboard(seriesId, obj) {
         if (!obj || !Array.isArray(obj.teams)) return;
         const byNick = {};
         const teams = [];
         obj.teams.forEach(t => {
-            teams.push({ id: String(t.id), name: t.name, kda: kdaFrom(t.dataPoints) });
+            teams.push({ id: String(t.id), name: t.name, kda: kdaFrom(t.dataPoints),
+                cr: moneyOf(dpOf(t.dataPoints, 'CR')), nw: moneyOf(dpOf(t.dataPoints, 'NW')) });
             (t.players || []).forEach(p => {
                 const kda = kdaFrom(p.dataPoints);
                 // Joined on nickname, not id: the ids in this payload come
                 // through rounded (…53186000), so they do not survive a
                 // comparison with the real 17-digit steam ids on the main feed.
-                if (kda && p.name) byNick[String(p.name).toLowerCase()] = kda;
+                if (!p.name) return;
+                byNick[String(p.name).toLowerCase()] = Object.assign({}, kda || {}, {
+                    cr: moneyOf(dpOf(p.dataPoints, 'CR')), nw: moneyOf(dpOf(p.dataPoints, 'NW')),
+                    items: (p.items || []).map(i => i && i.label).filter(Boolean),
+                    hp: p.primaryFillBar ? p.primaryFillBar.fillFraction : null,
+                });
             });
         });
         S.games.forEach(g => {
@@ -1471,6 +1933,48 @@
         S.seriesStatus = 'live';
         S.dirty = true;
     }
+
+    // series_table: stateGroups (Series / Game / Round / Freezetime) -> states
+    // (by sequenceNumber) -> entityGroups ("Player") with dataPointDefinitions
+    // naming the columns, and entitySubGroups (teams) -> entities (players)
+    // whose dataPoints follow that order. Kept: the Series totals and every
+    // Game (map) - Kills, Assists, Deaths, Headshots by nickname.
+    function applySeriesTable(seriesId, obj) {
+        if (!obj || !Array.isArray(obj.stateGroups)) return;
+        const pick = (group, seq) => {
+            const out = {};
+            const st = seq === undefined ? group.states[group.states.length - 1] : group.states.find(x => x.sequenceNumber === seq);
+            const pg = st && (st.entityGroups || []).find(x => x.name === 'Player');
+            if (!pg) return out;
+            const defs = (pg.dataPointDefinitions || []).map(d => d.name);
+            const col = n => defs.indexOf(n);
+            (pg.entitySubGroups || []).forEach(sg => (sg.entities || []).forEach(en => {
+                const v = i => (i >= 0 && en.dataPoints && en.dataPoints[i]) ? en.dataPoints[i].value : null;
+                out[String(en.name).toLowerCase()] = { k: v(col('Kills')), a: v(col('Assists')), d: v(col('Deaths')), hs: v(col('Headshots')) };
+            }));
+            return out;
+        };
+        const table = { at: Date.now(), series: {}, games: {} };
+        obj.stateGroups.forEach(gr => {
+            if (gr.name === 'Series' && gr.states && gr.states.length) table.series = pick(gr);
+            if (gr.name === 'Game') (gr.states || []).forEach(st => { table.games[st.sequenceNumber] = pick(gr, st.sequenceNumber); });
+        });
+        S.games.forEach(g => { if (g.seriesId === seriesId) g.gridTable = table; });
+        S.dirty = true;
+    }
+
+    // Weapon a player is carrying, from GRID's items: the best gun
+    // (sniper > rifle > smg > pistol), ignoring armour, kits and grenades.
+    const WRANK = { sniper: 4, rifle: 3, smg: 2, pistol: 1 };
+    function carriedWeapon(items) {
+        let best = null, rank = 0;
+        (items || []).forEach(it => { const r = WRANK[WCAT[it]] || 0; if (r > rank) { rank = r; best = it; } });
+        return best;
+    }
+    const fmtMoney = n => (n == null ? '—' : n >= 1000 ? `$${(n / 1000).toFixed(1)}K` : `$${n}`);
+    // GRID stats are trusted while fresh; otherwise the panel falls back to
+    // what it counted live from the game feed.
+    const gridFresh = g => !!(g && g.seriesStats && Date.now() - g.seriesStats.at < 60000);
 
     // Nothing in the tree feed says whether a match has GRID game-state
     // coverage — the one match that did and the ones that never will carry an
@@ -1523,7 +2027,7 @@
         const g = S.games.get(S.active);
         const since = g ? Date.now() - g.lastUpdate : Infinity;
         if (since < STALE_MS) return;
-        if (Date.now() - S.lastResub < STALE_MS) return;
+        if (Date.now() - S.lastResub < RESUB_MS) return;
         S.lastResub = Date.now();
         S.retries.set(S.active, (S.retries.get(S.active) || 0) + 1);
         sendSub(sock, S.active);
@@ -1545,6 +2049,28 @@
         store(vetoKey(matchId, mapNum), opts[(opts.indexOf(cur) + 1) % opts.length]);
         S.dirty = true;
     }
+    // The pick as GRID's veto tells it, by map name: { label, title } or null.
+    // The manual pick (click to cycle) stays as the fallback with no veto.
+    const mapKeyName = n => String(n || '').toLowerCase().replace(/^(de|cs)_/, '').replace(/[^a-z0-9]/g, '');
+    function gridPick(mapName, teams) {
+        const v = vetoOf(activeSeries());
+        if (!v || !v.steps.length || !mapName) return null;
+        const k = mapKeyName(mapName);
+        const step = v.steps.find(x => (x.action === 'pick' || x.action === 'decider') && mapKeyName(x.map) === k);
+        if (!step) return null;
+        const side = v.steps.find(x => x.action === 'side' && mapKeyName(x.map) === k);
+        // Show betboom's own spelling of the team when it pairs by name.
+        const named = n => {
+            let best = null, sc = 0;
+            (teams || []).forEach(t => { const x = nameScore(n, t.name); if (x > sc) { sc = x; best = t; } });
+            return best ? best.name : n;
+        };
+        const label = step.action === 'decider' ? 'decider' : 'pick ' + named(step.team);
+        const title = 'From the GRID veto: ' + (step.action === 'decider' ? 'decider map' : `${step.team} picked ${step.map}`) +
+            (side ? `; ${side.team} chose ${side.side}` : step.action === 'decider' ? '; no side choice (knife round)' : '');
+        return { label, title };
+    }
+
     function vetoLabel(matchId, mapNum, teams) {
         const v = getVeto(matchId, mapNum);
         if (!v) return 'pick —';
@@ -1679,6 +2205,8 @@
   display:inline-block;max-width:100%;overflow:hidden;user-select:none;
   text-overflow:ellipsis;white-space:nowrap}
 .mh-veto:hover{color:#cfe0f5;border-color:#4a9eff}
+.mh-veto.auto{color:#9fd7b0;border-bottom-style:solid;border-color:#1f4a35;cursor:help}
+.mh-veto.auto:hover{color:#c8f0d6;border-color:#2f7a52}
 .mh-map .mh-badge{position:absolute;top:3px;right:4px;font-size:7.5px;font-weight:700;
   padding:1px 3px;border-radius:2px}
 .mh-badge.live{background:#3a1220;color:#ff5a72}
@@ -1781,6 +2309,15 @@
   font-weight:700;color:#8ba0bb;background:#16233a;border-radius:2px}
 .mh-ev.suicide span{color:#c76b8a}
 .mh-ev.phase span{color:#8ba0bb}
+.mh-ev.ll span{color:#a9bad0}
+.mh-ev.ll.round span{color:#cfe0f5;font-weight:600}
+.mh-ev.ll.bomb span{color:#ff8a5c}
+.mh-ev.ll b.ll-CT{color:#6bb0ff;font-weight:700}
+.mh-ev.ll b.ll-T{color:#e0a441;font-weight:700}
+.mh-eco{display:flex;justify-content:space-between;padding:3px 7px;font-size:10px;color:#93a7c1;border-bottom:1px solid #16243a}
+.mh-eco b{color:#7fe0a8}
+.mh-stv.cash{color:#7fe0a8;min-width:38px;text-align:right}
+.mh-stv.gun{color:#93a7c1;min-width:46px;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ---------- analytics ---------- */
 .mh-bars{display:flex;gap:5px;padding:5px 6px;align-items:center}
@@ -1804,6 +2341,24 @@
 .mh-sc:hover{color:#cfe0f5}
 .mh-sc.on{background:#1d3554;border-color:#33507a;color:#7fc0ff}
 .mh-wp{padding:5px 7px}
+.mh-vetobox{padding:4px 7px;font-size:10px;line-height:1.45}
+.mh-vetobox .vm{display:flex;gap:5px;align-items:baseline}
+.mh-vetobox .vm b{color:#cfe0f5}
+.mh-vetobox .vn{color:#5f7591;flex:none;width:12px}
+.mh-vetobox .vby{color:#7f93ad;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.mh-vetobox .vs.CT{color:#6bb0ff;font-weight:700}.mh-vetobox .vs.T{color:#e0a441;font-weight:700}
+.mh-vetobox .vbans{color:#5f7591;margin-top:2px}
+.mh-vetobox .vbans s{color:#8a5560}
+.mh-vset{display:flex;gap:4px;align-items:center;padding:2px 7px 5px;font-size:9.5px;color:#5f7591;flex-wrap:wrap}
+.mh-vset span{flex:1 1 100%}
+.mh-vset input{flex:1;min-width:0;background:#0b1422;border:1px solid #23364f;color:#cfe0f5;border-radius:3px;padding:2px 5px;font:10px inherit}
+.mh-vset input:focus{outline:none;border-color:#4a9eff}
+.mh-probe{padding:0 7px 4px;font-size:9.5px;color:#7f93ad}
+.mh-probe:empty{display:none}
+.mh-probe .pr-h{color:#5f7591;margin-top:3px}
+.mh-probe .pr-r{display:grid;grid-template-columns:1.6fr 1fr 1fr;gap:4px}
+.mh-probe .pr-s{color:#cfe0f5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mh-probe .pr-ok{color:#7fe0a8}.mh-probe .pr-no{color:#8a5560}
 .mh-wp svg{width:100%;height:30px;display:block}
 .mh-wplbl{display:flex;justify-content:space-between;font-size:9.5px;margin-top:2px;
   font-weight:700;letter-spacing:.05em}
@@ -1898,6 +2453,16 @@
             <button class="mh-gl" id="mh-wplog" title="Show odds history">&#9662;</button></div>
             <div class="mh-wp" id="mh-wp"></div>
             <div class="mh-scroll mh-oddslog" id="mh-oddslog" style="display:none"></div></div>
+          <div class="mh-card" id="mh-vetocard"><div class="mh-h"><span class="grow">Veto</span>
+            <span id="mh-vetost" style="color:#5f7591;font-size:9px"></span>
+            <button class="mh-sc" id="mh-vetocp" title="Copy the veto as text, one step per line (as Onak shows it)">&#10697;</button>
+            <button class="mh-sc" id="mh-vetore" title="Ask again now: betboom match details, live log and stats sockets">&#8635;</button>
+            <button class="mh-sc" id="mh-probebtn" title="Ask betboom's GRID proxy for every widget service (one at a time, both forms) and download a JSON report">probe</button></div>
+            <div id="mh-veto" class="mh-vetobox"></div>
+            <div class="mh-vset"><span id="mh-vsid"></span>
+              <input id="mh-vsin" type="text" placeholder="GRID series id or Polymarket link" spellcheck="false">
+              <button class="mh-sc" id="mh-vsok" title="Use this series for the match open here (kept 36h). Empty + set clears it.">set</button></div>
+            <div id="mh-probe" class="mh-probe"></div></div>
           <div class="mh-card" style="flex:1"><div class="mh-h" id="mh-sh1"><span class="grow">Team 1</span></div>
             <div class="mh-scroll" id="mh-s1"></div></div>
           <div class="mh-card" style="flex:1"><div class="mh-h" id="mh-sh2"><span class="grow">Team 2</span></div>
@@ -1907,6 +2472,17 @@
         document.body.appendChild(root);
 
         root.querySelector('#mh-close').addEventListener('click', toggle);
+        root.querySelector('#mh-probebtn').addEventListener('click', () => { gridProbe(); });
+        root.querySelector('#mh-vetore').addEventListener('click', () => { refreshNow(); S.manualNote = 'asked again'; });
+        root.querySelector('#mh-vetocp').addEventListener('click', () => {
+            const v = vetoOf(activeSeries());
+            if (!v || !v.steps.length) { S.manualNote = 'no veto to copy yet'; S.dirty = true; return; }
+            copyText(vetoText(v.steps));
+            S.manualNote = 'veto copied'; S.dirty = true;
+        });
+        const vsin = root.querySelector('#mh-vsin');
+        root.querySelector('#mh-vsok').addEventListener('click', () => { setManualSeries(vsin.value); vsin.value = ''; });
+        vsin.addEventListener('keydown', ev => { ev.stopPropagation(); if (ev.key === 'Enter') { setManualSeries(vsin.value); vsin.value = ''; } });
         root.querySelector('#mh-max').addEventListener('click', toggleMax);
         root.querySelector('#mh-tl').addEventListener('click', () => togglePane('nol', 'hideLeft'));
         root.querySelector('#mh-tr').addEventListener('click', () => togglePane('nor', 'hideRight'));
@@ -2299,6 +2875,55 @@
         });
     }
 
+    function renderGridStats(g, t, box, mn) {
+        const sb = g.seriesStats;
+        const gt = g.gridTable;
+        const mapTab = gt && (gt.games[mn] || gt.games[Math.max(...Object.keys(gt.games).map(Number))]) || {};
+        const sbTeam = sb.teams.find(x => nameScore(x.name, t.name) > 0);
+        if (sbTeam && (sbTeam.cr != null || sbTeam.nw != null)) {
+            const eco = el('div', 'mh-eco');
+            const left = el('span', ''); left.append('Economy: '); left.appendChild(el('b', '', fmtMoney(sbTeam.cr)));
+            eco.append(left, el('span', '', `value ${fmtMoney(sbTeam.nw)}`));
+            eco.title = 'Team money (CR) and money + equipment value (NW), from GRID (~8s)';
+            box.appendChild(eco);
+        }
+        const rows = activePlayers(g, t).map(p => {
+            const key = String(p.nick).toLowerCase();
+            const sp = sb.byNick[key] || {};
+            const tb = mapTab[key] || {};
+            const k = tb.k != null ? tb.k : sp.k, d = tb.d != null ? tb.d : sp.d, a = tb.a != null ? tb.a : sp.a;
+            return { p, k, d, a, hs: tb.hs, cr: sp.cr, gun: carriedWeapon(sp.items), items: sp.items || [],
+                ser: gt && gt.series[key], live: (g.stats[mn] || {})[p.steam] || EMPTY_STAT };
+        });
+        rows.sort((x, y) => (y.k || 0) - (x.k || 0));
+        // GRID strips money and items from its fast (delay=zero, 8s) feed; they
+        // only come on the 180s one. Their columns show only when present.
+        const hasCash = rows.some(r => r.cr != null);
+        const hasGun = rows.some(r => r.gun);
+        rows.forEach(r => {
+            const open = S.expandedPlayer === r.p.steam;
+            const row = el('div', 'mh-strow' + (open ? ' mh-open' : ''));
+            row.appendChild(el('div', 'mh-stn', r.p.nick));
+            row.appendChild(el('div', 'mh-stv', r.k != null ? `${r.k}/${r.d}/${r.a}` : '—'));
+            row.appendChild(el('div', 'mh-stv hs', r.hs != null ? `${r.hs}hs` : '—'));
+            if (hasCash) row.appendChild(el('div', 'mh-stv cash', fmtMoney(r.cr)));
+            if (hasGun) row.appendChild(el('div', 'mh-stv gun', r.gun ? weaponName(r.gun) : ''));
+            row.title = `This map, from GRID: ${r.k}/${r.d}/${r.a}` + (r.hs != null ? ` · ${r.hs} HS` : '') +
+                (r.cr != null ? ` · money ${fmtMoney(r.cr)}` : '') + (r.items.length ? `\nCarrying: ${r.items.map(weaponName).join(', ')}` : '') +
+                (r.ser ? `\nSeries: ${r.ser.k}/${r.ser.d}/${r.ser.a} · ${r.ser.hs} HS` : '');
+            row.addEventListener('click', () => { S.expandedPlayer = open ? null : r.p.steam; render(); });
+            box.appendChild(row);
+            if (open) {
+                const panel = el('div', 'mh-wpn');
+                const line = (label, val) => { const d0 = el('div'); d0.append(el('span', '', label), el('i', '', val)); panel.appendChild(d0); };
+                if (r.ser) line('Series (GRID)', `${r.ser.k}/${r.ser.d}/${r.ser.a} · ${r.ser.hs} HS`);
+                line('Kills per half (counted live)', `1st ${r.live.h1} · 2nd ${r.live.h2} · OT ${r.live.ot}`);
+                if (r.items.length) line('Carrying', r.items.map(weaponName).join(', '));
+                box.appendChild(panel);
+            }
+        });
+    }
+
     // ---------- map pills ----------
     function renderMaps(g) {
         const box = root.querySelector('#mh-maps');
@@ -2314,13 +2939,19 @@
             const r2 = t2 && m.sides[t2.id] ? m.sides[t2.id].rounds : 0;
             card.appendChild(el('div', 'mh-msc', `${r1} — ${r2}`));
 
-            const veto = el('div', 'mh-veto', vetoLabel(g.matchId, m.num, g.teams));
-            veto.title = 'Click to set which team picked this map';
-            veto.addEventListener('click', ev => {
-                ev.stopPropagation();
-                cycleVeto(g.matchId, m.num, g.teams);
-                render();
-            });
+            const auto = gridPick(m.name, g.teams);
+            const veto = el('div', 'mh-veto' + (auto ? ' auto' : ''), auto ? auto.label : vetoLabel(g.matchId, m.num, g.teams));
+            if (auto) {
+                veto.title = auto.title;
+                veto.addEventListener('click', ev => ev.stopPropagation());
+            } else {
+                veto.title = 'Click to set which team picked this map (no GRID veto for this series)';
+                veto.addEventListener('click', ev => {
+                    ev.stopPropagation();
+                    cycleVeto(g.matchId, m.num, g.teams);
+                    render();
+                });
+            }
             card.appendChild(veto);
 
             const played = r1 + r2 > 0;
@@ -2357,7 +2988,7 @@
                 const n = S.retries.get(S.active) || 0;
                 fg.appendChild(el('div', 'mh-empty',
                     'Waiting for the game-state feed.\n' +
-                    (n ? `Retried ${n}\u00d7 · next in <20s` : 'Retrying every 20s')));
+                    (n ? `Retried ${n}\u00d7 · next in <5s` : 'Retrying every 5s')));
             }
             return;
         }
@@ -2415,12 +3046,17 @@
             row.appendChild(el('div', 'mh-dot' + (isDead ? ' dead' : '')));
             row.appendChild(el('div', 'mh-nick', p.nick));
 
-            const cat = weaponCat(weaps[p.steam]);
+            // GRID says what each player carries; the last kill's weapon is
+            // the fallback when GRID is not there (or for a past map).
+            const gp = gridFresh(g) && S.selectedMapNum === null ? g.seriesStats.byNick[String(p.nick).toLowerCase()] : null;
+            const carried = gp ? carriedWeapon(gp.items) : null;
+            const wpn = carried || weaps[p.steam];
+            const cat = weaponCat(wpn);
             if (cat) {
                 const holder = document.createElement('div');
                 holder.innerHTML = `<svg class="mh-w ${cat}" viewBox="0 0 12 12">${WICON[cat]}</svg>`;
                 const svg = holder.firstChild;
-                svg.setAttribute('title', `Last kill this round: ${weaponName(weaps[p.steam])}`);
+                svg.setAttribute('title', carried ? `Carrying (GRID): ${weaponName(carried)}` : `Last kill this round: ${weaponName(wpn)}`);
                 row.appendChild(svg);
             } else {
                 row.appendChild(el('div', 'mh-w ph'));
@@ -2438,6 +3074,52 @@
         });
     }
 
+    // GRID's live log, oldest to newest like the other tabs. Team-coloured
+    // chunks ("teams.<id>") take the colour of that team's current side.
+    function renderLiveLog(g, box, stick) {
+        const sid = activeSeries();
+        const L = sid ? S.liveLog[sid] : null;
+        if (!L || !L.rows.length) {
+            box.appendChild(el('div', 'mh-empty', !sid ? 'Waiting for the series id…'
+                : `No live log yet (${S.vetoStatus}).`));
+            return;
+        }
+        if (L.dirty) { L.rows.sort((a, b) => a.ts.localeCompare(b.ts)); L.dirty = false; }
+        const sideByName = {};
+        if (g) g.teams.forEach(t => { const sd = sideOf(g, t); if (sd) sideByName[normName(t.name)] = sd; });
+        const sideFor = txt => {
+            if (sideByName[normName(txt)]) return sideByName[normName(txt)];
+            if (g) for (const t of g.teams) if (nameScore(txt, t.name)) return sideOf(g, t);
+            return null;
+        };
+        const nickSide = {};
+        if (g) g.teams.forEach(t => activePlayers(g, t).forEach(p => { nickSide[normName(p.nick)] = sideOf(g, t); }));
+        // Players are tagged with their team's GRID id ("teams.51961"), not its
+        // name: learn id -> side from entries where the chunk IS the team name
+        // (veto, "X won Round N"), then colour every chunk with that id.
+        const idSide = {};
+        L.rows.forEach(r => r.chunks.forEach(c => {
+            const id = (/^teams\.(\d+)/.exec(c.color) || [])[1];
+            if (id && !idSide[id]) { const sd = sideFor(c.text); if (sd) idSide[id] = sd; }
+        }));
+        L.rows.slice(-300).forEach(r => {
+            const cls = /kill/i.test(r.cat) ? 'kill' : /objective/i.test(r.cat) ? 'bomb' : /won Round|Round \d+ (started|ended)|Game \d|Series/.test(r.text) ? 'round' : 'phase';
+            const row = el('div', 'mh-ev ll ' + cls);
+            const tm = el('time', '', (r.ts ? new Date(r.ts).toTimeString().slice(0, 8) : '') + (r.gameTime ? ' ' + r.gameTime : ''));
+            row.appendChild(tm);
+            const txt = el('span', '');
+            r.chunks.forEach((c, i) => {
+                if (i) txt.append(' ');
+                const id = (/^teams\.(\d+)/.exec(c.color) || [])[1];
+                const sd = (id && idSide[id]) || (id && sideFor(c.text)) || nickSide[normName(c.text)] || null;
+                if (sd) txt.appendChild(el('b', 'll-' + sd, c.text)); else txt.append(c.text);
+            });
+            row.appendChild(txt);
+            box.appendChild(row);
+        });
+        if (stick) box.scrollTop = box.scrollHeight;
+    }
+
     // ---------- log ----------
     function renderLog(g) {
         const box = root.querySelector('#mh-log');
@@ -2445,23 +3127,23 @@
         const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
         box.textContent = '';
         tabs.textContent = '';
-        if (!g) { box.appendChild(el('div', 'mh-empty', 'No events yet.')); return; }
 
         // "Current" follows whichever map the rest of the panel is showing, so
         // clicking a map tab moves the whole panel together instead of leaving
         // the log describing a different map than the scoreboard above it.
-        const m = activeMap(g);
-        const curNum = m ? m.num : g.liveMapNum;
+        const m = g ? activeMap(g) : null;
+        const curNum = m ? m.num : (g ? g.liveMapNum : null);
         const cur = [], past = [];
-        g.events.forEach(e => {
+        (g ? g.events : []).forEach(e => {
             (e.mapNum === null || e.mapNum === undefined || e.mapNum === curNum ? cur : past).push(e);
         });
 
-        [['cur', 'Current map', cur], ['past', 'Past logs', past]].forEach(([key, label]) => {
+        [['cur', 'Current map', cur], ['past', 'Past logs', past], ['live', 'Live log', null]].forEach(([key, label]) => {
             const b = el('button', 'mh-sc' + (S.logTab === key ? ' on' : ''), label);
             b.title = key === 'cur'
                 ? `Events on ${m ? m.name || ('map ' + curNum) : 'the current map'}`
-                : 'Everything captured on the other maps of this match';
+                : key === 'past' ? 'Everything captured on the other maps of this match'
+                : 'GRID\u2019s own live log for this series (via betboom\u2019s proxy, ~8s): every kill, bomb, round, pause and the veto';
             b.addEventListener('click', ev => {
                 ev.stopPropagation();
                 S.logTab = key;
@@ -2470,6 +3152,8 @@
             tabs.appendChild(b);
         });
 
+        if (S.logTab === 'live') { renderLiveLog(g, box, stick); return; }
+        if (!g) { box.appendChild(el('div', 'mh-empty', 'No events yet.')); return; }
         const shown = S.logTab === 'past' ? past : cur;
         if (!shown.length) {
             box.appendChild(el('div', 'mh-empty', S.logTab === 'past'
@@ -2604,6 +3288,53 @@
         const o = g ? S.odds.get(g.matchId) : null;
         if (!o || !o.markets) return [];
         return Object.keys(o.markets).map(k => o.markets[k]).filter(e => e.scope === scope);
+    }
+
+    // Veto card: maps in play order (team picks, then the decider), the side
+    // each picker's opponent chose, and the bans in one line underneath.
+    function renderVeto(g) {
+        const box = root && root.querySelector('#mh-veto');
+        const st = root && root.querySelector('#mh-vetost');
+        if (!box) return;
+        const sid = activeSeries();
+        const steps = (vetoOf(sid) || { steps: [] }).steps;
+        const status = (!sid ? 'no series' : steps.length ? (S.vetoStatus === 'saved' ? 'saved' : S.vetoStatus) : S.vetoStatus) +
+            (sid && S.active && S.seriesHinted.has(String(S.active)) ? ' · id via Onak' : '');
+        if (st) {
+            st.textContent = status + (S.vetoDelay !== null && steps.length && S.vetoStatus === 'live' ? ` · ${S.vetoDelay}s` : '');
+            st.title = S.vetoForm ? `live log answered with: ${S.vetoForm}` : 'form of the request not known yet (veto shown from storage)';
+        }
+        const sl = root.querySelector('#mh-vsid');
+        if (sl) {
+            const src = S.active ? S.seriesSrc.get(String(S.active)) : null;
+            sl.textContent = (sid ? `series ${sid}${src ? ' · from ' + src : ''}` : 'no series id yet') + (S.manualNote ? ` · ${S.manualNote}` : '');
+        }
+        const sig = JSON.stringify([steps.map(x => x.id), status]);
+        if (box.dataset.sig === sig) return;
+        box.dataset.sig = sig;
+        box.textContent = '';
+        if (!steps.length) {
+            box.appendChild(el('div', '', !sid ? 'waiting for the series id (betboom, or Onak via Polymarket)…'
+                : S.vetoStatus === 'refused' ? 'betboom\u2019s proxy refused the live log' : 'no veto yet'));
+            return;
+        }
+        const maps = [];
+        steps.filter(x => x.action === 'pick').forEach(x => maps.push({ map: x.map, by: x.team }));
+        steps.filter(x => x.action === 'decider').forEach(x => maps.push({ map: x.map, by: 'decider' }));
+        maps.forEach((m, i) => {
+            const side = steps.find(x => x.action === 'side' && String(x.map).toLowerCase() === String(m.map).toLowerCase());
+            const row = el('div', 'vm');
+            row.append(el('span', 'vn', String(i + 1)), el('b', '', m.map), el('span', 'vby', m.by === 'decider' ? 'decider' : m.by));
+            if (side) { row.append(el('span', 'vby', side.team), el('span', 'vs ' + side.side, side.side)); }
+            box.appendChild(row);
+        });
+        const bans = steps.filter(x => x.action === 'ban');
+        if (bans.length) {
+            const b = el('div', 'vbans');
+            b.append('bans: ');
+            bans.forEach((x, i) => { b.append(el('s', '', x.map)); b.append(` ${x.team}${i < bans.length - 1 ? ' · ' : ''}`); });
+            box.appendChild(b);
+        }
     }
 
     function renderWinProb(g) {
@@ -2756,7 +3487,9 @@
             const dot = el('span', 'mh-gs ' + (S.seriesStatus === 'live' ? 'on' : 'off'), 'GRID');
             dot.title = 'GRID series scoreboard: ' + S.seriesStatus +
                 (S.seriesDelay !== null ? ` · declares ~${S.seriesDelay}s delay` : '') +
-                '\nSupplies cumulative series K/D/A, including rounds played before connect.';
+                '\nSupplies cumulative series K/D/A, including rounds played before connect.' +
+                `\nVeto (live log via betboom's proxy): ${S.vetoStatus}` + (S.vetoDelay !== null ? ` · ~${S.vetoDelay}s delay` : '') +
+                ` · ${((vetoOf(activeSeries()) || { steps: [] }).steps).length} steps`;
             head.appendChild(dot);
         }
         if (!t) return;
@@ -2764,6 +3497,11 @@
         const m = activeMap(g);
         const mn = m ? m.num : g.liveMapNum;
         const table = g.stats[mn] || {};
+
+        // 1.12.0: with GRID fresh, the numbers are GRID's - this map's
+        // K/D/A/HS (series_table, Game), money and weapon (team_scoreboard).
+        // The live count from the game feed is the fallback without GRID.
+        if (gridFresh(g)) { renderGridStats(g, t, box, mn); return; }
 
         const ser = g.seriesStats;
         const rows = activePlayers(g, t).map(p => ({
@@ -2935,6 +3673,7 @@
         if (!root.classList.contains('mh-nor')) {
             renderBars(g);
             renderWinProb(g);
+            renderVeto(g);
             renderTeamStats(g, ord[0], '#mh-sh1', '#mh-s1');
             renderTeamStats(g, ord[1], '#mh-sh2', '#mh-s2');
         }
@@ -2977,6 +3716,9 @@
         setInterval(() => { if (S.open && S.dirty) { S.dirty = false; render(); } }, 350);
         setInterval(watchdog, 5000);
         setInterval(ensureSeriesSocket, 3000);
+        manualLoad();
+        setInterval(ensureVetoSocket, 3000);
+        setInterval(() => requestDetails(false), 3000);
         setInterval(probeMatches, 700);
         checkClock();
         setInterval(checkClock, 600000);
