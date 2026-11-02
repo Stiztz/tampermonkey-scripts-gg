@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Dibu Onak (bb + Polymarket → Raiden)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      3.5.0
+// @version      3.7.12
 // @description  Feeds Dibu Scraper's betboom state and Polymarket's live score into Raiden's CS2 trader inputs
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=oddin.gg
 // @author       GG
 // @match        https://betboom.ru/esport/*
 // @match        https://betboom.ru/sport/*
 // @match        https://polymarket.com/*
+// @match        https://*.polymarket.com/*
 // @match        https://cross.bet/*
 // @match        https://www.cross.bet/*
 // @match        https://raiden.oddin.gg/*
@@ -79,6 +80,7 @@
     if (/(^|\.)betboom\.ru$/.test(HOST)) {
         if (window.top !== window.self) return;
         const BB_TAB = Math.random().toString(36).slice(2, 10);
+        let lastSnap = null;               // the Dibu's latest snapshot (for series hints)
         window.addEventListener('message', ev => {
             const d = ev.data;
             // 'dibu-link:v1' is the message tag Dibu Scraper posts. It is a
@@ -88,8 +90,103 @@
             // tell them apart instead of taking whichever wrote last.
             try { GM_setValue('onak:bb', { at: d.at || Date.now(), tab: BB_TAB, snap: d.snap }); }
             catch (e) { /* storage full or TM restarting: next heartbeat retries */ }
+            const firstTime = !lastSnap || lastSnap.matchId !== (d.snap && d.snap.matchId);
+            lastSnap = d.snap;
+            if (firstTime) sendHints(); // eslint-disable-line no-use-before-define
         });
+        // Series-id hints for the Dibu, so the veto can be read before betboom
+        // says which GRID series it is: from Raiden (its Polymarket link) and,
+        // without Raiden, from any open Polymarket tab whose two team names
+        // match the betboom match open in the Dibu.
+        const nm = x => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+            .replace(/\b(team|esports?|gaming|club|academy)\b/g, '').replace(/[^a-z0-9]/g, '');
+        const like = (a, b) => { a = nm(a); b = nm(b); return !!a && !!b && (a === b || (Math.min(a.length, b.length) >= 3 && (a.indexOf(b) >= 0 || b.indexOf(a) >= 0))); };
+        const fromPolymarket = () => {
+            const sn = lastSnap;
+            if (!sn || !sn.matchId || (sn.veto && sn.veto.seriesId)) return null;
+            const names = sn.teams && sn.teams.length === 2 ? sn.teams.map(t => t.name) : (sn.metaTeams || []);
+            if (names.length !== 2) return null;
+            const all = GM_getValue('onak:pmseries', null) || {};
+            const hits = Object.keys(all).filter(sid => {
+                const t = all[sid].teams || [];
+                return t.length === 2 && ((like(names[0], t[0]) && like(names[1], t[1])) || (like(names[0], t[1]) && like(names[1], t[0])));
+            });
+            return hits.length === 1 ? { [sn.matchId]: hits[0] } : null;   // ambiguous: say nothing
+        };
+        const sendHints = () => {
+            const h = GM_getValue('onak:hint', null);
+            const hints = Object.assign({}, h && h.hints && Date.now() - (h.at || 0) < 10 * 60000 ? h.hints : {}, fromPolymarket() || {});
+            if (Object.keys(hints).length) window.postMessage({ tag: 'onak-hint:v1', hints }, location.origin);
+        };
+        try {
+            GM_addValueChangeListener('onak:hint', () => sendHints());
+            GM_addValueChangeListener('onak:pmseries', () => sendHints());
+        } catch (e) { /* noop */ }
+        everyMs(10000, sendHints);
+        sendHints();
         return;
+    }
+
+    // GRID live log over a WebSocket, for the veto. The server sends the whole
+    // series backlog on connect, then new entries; payloads are gzip+base64.
+    // onEntries(entries) gets raw live-log entries; onStatus(status) one of
+    // connecting | open | closed | refused | blocked.
+    // Veto steps as text, one line per step, like the VETO tab:
+    // "22:32 Parivision banned Nuke", "22:33 G2 Esports chose CT on Dust2".
+    function vetoText(steps) {
+        const verb = { ban: 'banned', pick: 'picked', decider: 'decider', side: 'chose' };
+        return (steps || []).map(v => {
+            const t = v.ts ? new Date(v.ts).toTimeString().slice(0, 5) + ' ' : '';
+            return `${t}${v.team} ${verb[v.action] || v.action} ${v.action === 'side' ? `${v.side} on ${v.map}` : v.map}`;
+        }).join('\n');
+    }
+    function copyToClipboard(text) {
+        try { if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(text); return; } } catch (e) { /* fallback */ }
+        const ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } catch (e) { /* nothing more to try */ }
+        ta.remove();
+    }
+
+    // Raw GRID widget message -> live-log entries ([] for any other service).
+    async function gridLogEntries(raw) {
+        let msg; try { msg = JSON.parse(raw); } catch (e) { return []; }
+        if (!msg || !/live_log$/.test(String(msg.service || ''))) return [];
+        const gunzip = async b64 => {
+            const bin = atob(b64), u8 = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+            const buf = await new Response(new Blob([u8]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+            return JSON.parse(new TextDecoder().decode(buf));
+        };
+        const out = [];
+        for (const item of msg.data || []) {
+            let d = item;
+            try { if (item && item.isCompressed && item.data) d = await gunzip(item.data); } catch (e) { continue; }
+            const e = d && d.body && d.body.entryToAdd;
+            if (e) out.push(e); else if (d && Array.isArray(d.entries)) out.push(...d.entries);
+        }
+        return out;
+    }
+
+    function gridLiveLog(WSCtor, seriesId, onEntries, onStatus) {
+        let ws, opened = false;
+        const onMsg = async raw => {
+            const out = await gridLogEntries(raw);
+            if (out.length) onEntries(out);
+        };
+        try {
+            // Exactly as Polymarket's page asks for it since 2 Nov (delay=zero,
+            // live_log on its own socket); without delay=zero GRID sends nothing.
+            ws = new WSCtor(`wss://api.grid.gg/widgets-v2/live/${seriesId}?delay=zero&events=live_log&isCompressionEnabled=true`);
+        } catch (e) { onStatus('blocked'); return null; }
+        onStatus('connecting');
+        ws.addEventListener('open', () => { opened = true; onStatus('open'); });
+        ws.addEventListener('message', ev => {
+            if (typeof ev.data === 'string') onMsg(ev.data);
+            else if (ev.data && typeof ev.data.text === 'function') ev.data.text().then(onMsg);
+        });
+        ws.addEventListener('close', () => onStatus(opened ? 'closed' : 'refused'));
+        return ws;
     }
 
     // =====================================================================
@@ -100,7 +197,47 @@
     // and map, nothing else: no sides, no reason, no kills. The Raiden half
     // turns a +1 into a round result; everything else stays with betboom.
     if (/(^|\.)polymarket\.com$/.test(HOST)) {
-        if (window.top !== window.self) return;
+        // The page's own GRID live-log socket is read too. Polymarket runs its
+        // GRID widgets in iframes (/grid/1/widget.html?type=series-livelog...)
+        // and those frames open the GRID sockets - the main page cannot reach
+        // GRID itself. In such a frame Onak only relays the socket's messages
+        // to the main page; there they wait until the veto reader is set up.
+        const pageLog = { queue: [], handle: null, seen: 0 };
+        const inFrame = window.top !== window.self;
+        if (inFrame && /^\/grid\//.test(location.pathname)) console.log('[Dibu Onak] widget-frame relay active in', location.href);
+        try {
+            const PageWS = W.WebSocket;
+            const Hooked = function (url, protocols) {
+                const ws = protocols === undefined ? new PageWS(url) : new PageWS(url, protocols);
+                if (/api\.grid\.gg\/widgets-v2\/live\/\d+.*live_log/.test(String(url))) {
+                    ws.addEventListener('message', ev => {
+                        pageLog.seen = Date.now();
+                        const go = inFrame
+                            ? raw => { try { W.top.postMessage({ tag: 'onak-gridrelay:v1', url: String(url), raw }, '*'); } catch (e) { /* noop */ } }
+                            : raw => (pageLog.handle ? pageLog.handle(raw, String(url)) : pageLog.queue.push([raw, String(url)]));
+                        if (typeof ev.data === 'string') go(ev.data);
+                        else if (ev.data && typeof ev.data.text === 'function') ev.data.text().then(go);
+                    });
+                }
+                return ws;
+            };
+            Hooked.prototype = PageWS.prototype;
+            ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(k => { Hooked[k] = PageWS[k]; });
+            W.WebSocket = Hooked;
+        } catch (e) { /* the page's socket simply is not read */ }
+        if (inFrame) return;
+        window.addEventListener('message', ev => {
+            const d = ev.data;
+            if (!d || d.tag !== 'onak-gridrelay:v1' || typeof d.raw !== 'string') return;
+            // From THIS page's iframes only: the widget lives on vendor.polymarket.com
+            // (seen on 2 Nov), so any polymarket.com origin, or "null" if sandboxed.
+            const own = ev.origin === location.origin ||
+                ((/^https:\/\/([a-z0-9-]+\.)*polymarket\.com$/.test(ev.origin) || ev.origin === 'null') &&
+                    [...document.querySelectorAll('iframe')].some(f => f.contentWindow === ev.source));
+            if (!own) return;
+            pageLog.seen = Date.now();
+            if (pageLog.handle) pageLog.handle(d.raw, d.url); else pageLog.queue.push([d.raw, d.url]);
+        });
         const pmFetch = W.fetch.bind(W);
         const PM = { slug: null, seriesId: null, title: '', busy: false };
         const slugNow = () => {
@@ -132,6 +269,14 @@
                 const r = await pmFetch(`/api/esports/series-state?seriesId=${PM.seriesId}`, { credentials: 'include' });
                 if (!r.ok) return;
                 const j = await r.json();
+                // Series id + team names, published even before the match:
+                // betboom tabs use it to hand the Dibu its GRID series (veto).
+                if (j && Array.isArray(j.teams) && j.teams.length === 2) {
+                    const all = GM_getValue('onak:pmseries', null) || {};
+                    Object.keys(all).forEach(k => { if (Date.now() - all[k].at > 6 * 3600000) delete all[k]; });
+                    all[PM.seriesId] = { at: Date.now(), title: PM.title, teams: j.teams.map(t => t.name || '') };
+                    GM_setValue('onak:pmseries', all);
+                }
                 const g = j && gameOf(j);
                 if (!g || !Array.isArray(g.teams)) return;
                 GM_setValue('onak:pm', {
@@ -144,6 +289,100 @@
             finally { PM.busy = false; }
         }
         everyMs(1000, poll);
+
+        // Veto from this tab, as a fallback for Raiden (whose own GRID connection
+        // could be refused): same live log, published under 'onak:veto'.
+        const V = { sid: null, ws: null, status: 'idle', steps: [], retryAt: 0 };
+        // Add live-log entries to the veto (from our socket or the page's).
+        const takeEntries = entries => {
+            let added = false;
+            for (const e of entries) {
+                const v = parseVeto(e);
+                if (v && !V.steps.some(x => x.id === v.id)) { V.steps.push(v); added = true; }
+            }
+            if (!added) return;
+            V.steps.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+            try { GM_setValue('onak:vetocache:' + V.sid, { at: Date.now(), via: 'Polymarket tab', steps: V.steps }); } catch (e) { /* noop */ }
+            pubVeto(); // eslint-disable-line no-use-before-define
+        };
+        pageLog.handle = (raw, url) => {
+            const sid = (/\/live\/(\d+)/.exec(url) || [])[1];
+            if (!V.sid) { pageLog.queue.push([raw, url]); return; }   // series not known yet: keep it
+            if (sid !== V.sid) return;
+            gridLogEntries(raw).then(es => { if (es.length) { V.status = 'open'; takeEntries(es); } });
+        };
+        // A veto never changes once it is made: with the decider in, it is
+        // complete, the socket is closed and not asked for again.
+        const vetoDone = steps => steps.some(x => x.action === 'decider');
+        // Polymarket's "Live Log" tab only matters because it creates the widget
+        // iframe (vendor.polymarket.com/grid/1/widget.html?type=series-livelog)
+        // that connects to GRID. Onak creates the same iframe, hidden, while it
+        // still needs the veto - unless one of that series already exists (the
+        // page's, or the Polymarket scraper's). The URL is learned from the
+        // page's own iframe the first time; until then a minimal one.
+        const ownFrame = { el: null, sid: null, at: 0 };
+        function framesDeep() {
+            const out = [];
+            (function walk(root) { root.querySelectorAll('*').forEach(el => { if (el.tagName === 'IFRAME') out.push(el); if (el.shadowRoot) walk(el.shadowRoot); }); })(document);
+            return out;
+        }
+        function hiddenLivelog() {
+            const want = V.sid && !vetoDone(V.steps) ? V.sid : null;
+            if (ownFrame.el && ownFrame.sid !== want) { try { ownFrame.el.remove(); } catch (e) { /* gone */ } ownFrame.el = null; }
+            if (!want || !document.body) return;
+            const frames = framesDeep();
+            frames.forEach(f => {
+                if (f === ownFrame.el || !/^https:\/\/vendor\.polymarket\.com\/grid\/.*type=series-livelog/.test(f.src || '')) return;
+                const tpl = f.src.replace(/seriesId=\d+/, 'seriesId={SID}');
+                if (GM_getValue('onak:widgettpl', null) !== tpl) GM_setValue('onak:widgettpl', tpl);
+            });
+            const others = frames.some(f => f !== ownFrame.el && /type=series-livelog\b/.test(f.src || '') && new RegExp(`seriesId=${want}\\b`).test(f.src || ''));
+            if (others) return;
+            const url = (GM_getValue('onak:widgettpl', null) || `https://vendor.polymarket.com/grid/1/widget.html?type=series-livelog&seriesId={SID}&theme=dark&parentOrigin=${encodeURIComponent(location.origin)}`).replace('{SID}', want);
+            if (ownFrame.el) {
+                // nothing heard from it in 2 minutes (widgets not enabled yet?): reload it
+                if ((!pageLog.seen || pageLog.seen < ownFrame.at) && Date.now() - ownFrame.at > 120000) { ownFrame.el.src = url; ownFrame.at = Date.now(); }
+                return;
+            }
+            const f = document.createElement('iframe');
+            f.src = url;
+            f.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+            f.dataset.autoGrid = 'onak';
+            f.title = 'GRID live log (hidden, Dibu Onak)';
+            f.style.cssText = 'position:fixed;left:-10000px;top:0;width:400px;height:300px;opacity:0;pointer-events:none;border:0';
+            document.body.appendChild(f);
+            Object.assign(ownFrame, { el: f, sid: want, at: Date.now() });
+        }
+
+        const pubVeto = () => {
+            try { GM_setValue('onak:veto', { at: Date.now(), seriesId: V.sid, status: V.status, steps: V.steps, via: 'tab' }); } catch (e) { /* next beat */ }
+        };
+        everyMs(5000, () => {
+            if (PM.seriesId && PM.seriesId !== V.sid) {
+                try { if (V.ws) V.ws.close(); } catch (e) { /* noop */ }
+                V.sid = PM.seriesId; V.ws = null; V.retryAt = 0;
+                const saved = GM_getValue('onak:vetocache:' + V.sid, null);
+                V.steps = saved && Array.isArray(saved.steps) ? saved.steps : [];
+                V.status = V.steps.length ? 'saved' : 'idle';
+            }
+            if (V.sid && pageLog.queue.length) {
+                const q = pageLog.queue.splice(0);
+                q.forEach(([raw, url]) => pageLog.handle(raw, url));
+            }
+            hiddenLivelog();
+            if (V.sid && vetoDone(V.steps)) {
+                if (V.ws) { try { V.ws.close(); } catch (e) { /* noop */ } V.ws = null; }
+                if (V.status !== 'saved') V.status = 'complete';
+            } else if (V.sid && !V.ws && Date.now() >= V.retryAt) {
+                V.ws = gridLiveLog(W.WebSocket, V.sid, entries => takeEntries(entries), st => {
+                    if (vetoDone(V.steps) && st !== 'open') return;     // closed on purpose
+                    V.status = st;
+                    if (st === 'closed' || st === 'refused' || st === 'blocked') { V.ws = null; V.retryAt = Date.now() + 30000; }
+                    pubVeto();
+                });
+            }
+            if (V.sid) pubVeto();
+        });
         return;
     }
 
@@ -504,7 +743,7 @@
      * ctx.pm / ctx.cb: score sources, see scoreSources().
      * ctx: { armed, leader, auth, wsOpen, error, bb, bbAt, rd, mapping,
      *        raidenMapOrder, opts, relaxed, pm, oldLink, rdWatchedMs, rt, rdMapName,
-     *        authWaitMs }
+     *        authWaitMs, matchNum }
      * rt : Raiden's teams { home:{name,short}, away:{name,short} } or null
      * pm : { at, snap, wins:[{ map, round, winner, scores:{name:score}, at }] }
      *
@@ -561,6 +800,15 @@
 
         const bb = ctx.bb;
         if (!bb || now - ctx.bbAt > 4000) return bbHold('no signal from betboom (is the Dibu tab open?)');
+        // betboom's stats widget is Oddin's and names the Oddin match id, which is
+        // Raiden's match number. When the Dibu reports it and it is another
+        // match, nothing from that tab may be used (score sources still can).
+        // Not in test mode: test matches are copies under other numbers.
+        if (!ctx.relaxed && bb.oddinMatchId && ctx.matchNum && String(bb.oddinMatchId) !== String(ctx.matchNum)) {
+            alarm(`othermatch:${bb.oddinMatchId}:${ctx.matchNum}`, 'notify',
+                `the betboom tab is on another match (Oddin ${bb.oddinMatchId}, this Raiden match is ${ctx.matchNum}) — open the right match in the Dibu`);
+            return bbHold(`betboom tab is on another match (Oddin ${bb.oddinMatchId} ≠ ${ctx.matchNum})`);
+        }
         if (!bb.teams || bb.teams.length !== 2) return bbHold('betboom has no teams');
         // betboom far behind live: inputs still flow, just late. Notify only,
         // with hysteresis (on above 20s, off below 15s) so it does not flicker.
@@ -820,11 +1068,24 @@
         // from a result we sent (or a wipe we caused) for the previous round.
         // In relaxed mode scoresMatch is always true, which is how 2.1.0
         // confirmed points that never happened.
+        //
+        // "Confirm when bb agrees" (3.5.1) is the other way to confirm, for
+        // when someone or something else closes the rounds: Raiden's score,
+        // whoever set it, is confirmed once betboom shows exactly the same
+        // score for each side. Production only: test mode never compares real
+        // scores (its scoresMatch is always true - the 2.1.0 trap).
         const pending = (rd.light.score - rd.light.confirmed) + (rd.dark.score - rd.dark.confirmed);
         const ours = !!(st.result[R - 1] || st.autoClose[R - 1]);
-        if (opts.confirm && !running && unconfirmed && scoresMatch && pending === 1 && ours) {
-            const key = `${R}:${rd.light.score}:${rd.dark.score}`;
-            if (!st.confirm[key]) out.actions.push({ op: 'confirm', key });
+        const bbAgrees = !relaxed && rd.light.score === bySide.LIGHT.rounds && rd.dark.score === bySide.DARK.rounds;
+        const ckey = `${R}:${rd.light.score}:${rd.dark.score}`;
+        if (unconfirmed && opts.confirmBb && bbAgrees) {
+            if (!st.confirm[ckey]) out.actions.push({ op: 'confirm', key: ckey, why: 'matches bb' });
+        } else if (opts.confirm && !running && unconfirmed && scoresMatch && pending === 1 && ours) {
+            if (!st.confirm[ckey]) out.actions.push({ op: 'confirm', key: ckey, why: 'set by Onak' });
+        } else if (unconfirmed && opts.confirmBb && relaxed) {
+            out.info.push('score not confirmed: test mode does not compare scores with bb');
+        } else if (unconfirmed && opts.confirmBb && !running) {
+            out.warn.push(`score ${rd.light.score}-${rd.dark.score} (CT-T) not confirmed yet: bb shows ${bySide.LIGHT.rounds}-${bySide.DARK.rounds}`);
         } else if (opts.confirm && !running && unconfirmed && (pending !== 1 || !ours)) {
             out.warn.push(`score ${rd.light.score}-${rd.dark.score} not confirmed: ${pending !== 1 ? pending + ' unconfirmed points' : 'not set by this tool'} — confirm by hand`);
         }
@@ -873,6 +1134,165 @@
         return time !== 20;
     }
 
+    // ---- VETO ---------------------------------------------------------------
+    // From GRID's live log (wss://api.grid.gg/widgets-v2/live/<series>?events=live_log),
+    // which sends the whole series backlog on connect. Entries are structured:
+    // [team (color "teams.<id>") | "Series"] [banned | picked | picked_side] [map | side + map].
+    function parseVeto(e) {
+        const ch = e && e.sentenceChunks;
+        if (!ch || ch.length < 3) return null;
+        const key = c => (c && c.textTranslation && c.textTranslation.key) || '';
+        const act = key(ch[1]) || String(ch[1].text || '').toLowerCase().replace(/\s+/g, '_');
+        const team = String(ch[0].text || '').trim();
+        const series = key(ch[0]) === 'series' || /^series$/i.test(team);
+        const teamId = (/teams\.(\d+)/.exec(ch[0].color || '') || [])[1] || null;
+        const clean = v => String(v || '').replace(/^Map\s*/i, '').replace(/[[\]]/g, '').trim();
+        if (act === 'banned' || act === 'picked') {
+            const vars = ch[2].textTranslation && ch[2].textTranslation.variables;
+            return { id: e.id, ts: e.timestamp, team: series ? 'Series' : team, teamId,
+                action: act === 'banned' ? 'ban' : (series ? 'decider' : 'pick'), map: clean((vars && vars.map_name) || ch[2].text) };
+        }
+        if (act === 'picked_side') {
+            const m = /^(.*?)\s*\[(.+)\]\s*$/.exec(String(ch[2].text || ''));
+            if (!m) return null;
+            const raw = m[1].trim();
+            const side = /counter/i.test(raw) ? 'CT' : /^terror/i.test(raw) ? 'T' : /attack/i.test(raw) ? 'ATK' : /defen/i.test(raw) ? 'DEF' : raw;
+            return { id: e.id, ts: e.timestamp, team, teamId, action: 'side', side, map: m[2].trim() };
+        }
+        return null;
+    }
+    // Play order: the teams' picks in veto order, then the decider(s); bo1 is
+    // just the decider, bo5 four picks and a decider. Side choices attach by map.
+    function vetoMaps(steps) {
+        const maps = [];
+        for (const s of steps) if (s.action === 'pick') maps.push({ map: s.map, by: s.team, sides: [] });
+        for (const s of steps) if (s.action === 'decider') maps.push({ map: s.map, by: 'decider', sides: [] });
+        for (const s of steps) {
+            if (s.action !== 'side') continue;
+            const m = maps.find(x => mapNameKey(x.map) === mapNameKey(s.map));
+            if (m) m.sides.push({ team: s.team, side: s.side });
+        }
+        return maps.map((m, i) => Object.assign({ seq: i + 1 }, m));
+    }
+    /*
+     * Veto vs Raiden's prematch table, map by map in play order.
+     *   pre: [{ order, name, homeIsDark }]  rt: Raiden teams { home, away }
+     * Map: the veto's map N against prematch map N. Side: only where the veto
+     * has a side choice (normally not the decider, a knife round in CS2) and
+     * only CT/T; the team that chose starts on that side, so home starts DARK
+     * (T) exactly when (chooser is home) === (chosen side is T). A side left
+     * unknown in the prematch table is shown, not alerted.
+     */
+    function vetoCheck(maps, pre, rt) {
+        const rows = [], issues = [];
+        for (const m of maps) {
+            const p = (pre || []).find(x => x.order === m.seq) || null;
+            const row = { seq: m.seq, map: m.map, by: m.by, sides: m.sides, rdName: p ? p.name : null, mapOk: null, side: null };
+            if (p && p.name) {
+                row.mapOk = mapNameKey(p.name) === mapNameKey(m.map);
+                if (!row.mapOk) issues.push({ key: `veto:map:${m.seq}:${mapNameKey(m.map)}:${mapNameKey(p.name)}`, msg: `veto: map ${m.seq} is ${m.map}, but Raiden's prematch table has ${p.name}` });
+            }
+            const pick = m.sides.find(x => x.side === 'CT' || x.side === 'T');
+            if (pick && rt && rt.home && rt.away) {
+                const tm = pmTeamMap([{ name: pick.team }, { name: '\u0000other' }], [{ name: rt.home.name, role: 'home' }, { name: rt.away.name, role: 'away' }])
+                    || pmTeamMap([{ name: pick.team }, { name: '\u0000other' }], [{ name: rt.home.short, role: 'home' }, { name: rt.away.short, role: 'away' }]);
+                const role = tm && tm[pick.team] ? tm[pick.team].role : null;
+                const want = role ? (role === 'home') === (pick.side === 'T') : null;
+                const have = p && typeof p.homeIsDark === 'boolean' ? p.homeIsDark : null;
+                row.side = { team: pick.team, side: pick.side, role, want, have, ok: want === null || have === null ? null : want === have };
+                if (row.side.ok === false) {
+                    const nm = role === 'home' ? rt.home.name : rt.away.name;
+                    issues.push({ key: `veto:side:${m.seq}:${pick.team}:${pick.side}:${have}`,
+                        msg: `veto: on map ${m.seq} (${m.map}) ${pick.team} chose ${pick.side}, but Raiden's prematch table starts ${nm} on ${pick.side === 'CT' ? 'T (DARK)' : 'CT (LIGHT)'}` });
+                }
+            }
+            rows.push(row);
+        }
+        return { rows, issues };
+    }
+
+    // ---- ECONOMY ------------------------------------------------------------
+    // Raiden's "NEXT ROUND" economy is NEXT_ROUND_AFTER_LOSS: what a team buys
+    // next round IF IT LOSES this one. Onak fills it for both teams once a
+    // round is live, from the map's own history, whatever the data source
+    // (Kano or none). The current round and "Confirm buy" are never touched.
+    //
+    //   pistol (1, 13)                              -> ECO
+    //   won the previous round: 1 in a row          -> FORCE
+    //                           2+ in a row         -> FULL
+    //   lost the previous round, buying this round:
+    //     2nd round of a half (2, 14): ECO -> FULL, FORCE -> ECO (no money left)
+    //     later:                       FULL -> FORCE, FORCE -> FULL, ECO -> FULL
+    //   overtime (25+)                              -> FULL (money is reset)
+    // A forced pistol follow-up is the trader's call: he corrects the current
+    // round to FORCE and Onak recomputes.
+    const ECON_WRITE = { ECO: 'ECO', FORCE: 'FORCE', FULL: 'FULL_BUY' };
+    // Raiden has five buy values (capture of 29 Oct): ECO, FULL_ECO, FORCE,
+    // BUY, FULL_BUY. Onak writes only ECO / FORCE / FULL_BUY; when reading,
+    // BUY counts as a force and FULL_ECO as an eco.
+    const econBuy = v => (v === 'FULL_BUY' || v === 'FULL') ? 'FULL'
+        : (v === 'ECO' || v === 'FULL_ECO') ? 'ECO'
+        : (v === 'FORCE' || v === 'BUY') ? 'FORCE' : null;
+
+    // role: 'home' | 'away'. homeWon[i] = home won round i+1.
+    // cur: what the team is buying this round ('ECO'|'FORCE'|'FULL'|null).
+    function econAfterLoss(role, R, homeWon, cur) {
+        if (R > 24) return { value: 'FULL', why: 'overtime' };
+        if (R === 1 || R === 13) return { value: 'ECO', why: 'pistol round' };
+        const halfStart = R <= 12 ? 1 : 13;
+        const won = i => !!homeWon && homeWon[i - 1] !== undefined && (homeWon[i - 1] === (role === 'home'));
+        if (!homeWon || homeWon[R - 2] === undefined) return null;          // previous round unknown
+        if (won(R - 1)) {
+            let streak = 0;
+            for (let i = R - 1; i >= halfStart && won(i); i--) streak++;
+            return streak >= 2 ? { value: 'FULL', why: `${streak} wins in a row` } : { value: 'FORCE', why: 'won the last round' };
+        }
+        const second = R === halfStart + 1;
+        if (!cur) return null;                                              // buy unknown: leave it to the trader
+        if (second) return cur === 'FORCE' ? { value: 'ECO', why: 'forced after the pistol, no money left' }
+            : cur === 'ECO' ? { value: 'FULL', why: 'eco after the pistol' } : { value: 'FORCE', why: 'full after the pistol' };
+        if (cur === 'FULL') return { value: 'FORCE', why: 'lost on a full buy' };
+        return { value: 'FULL', why: `lost on ${cur.toLowerCase()}` };
+    }
+
+    /*
+     * ctx: { opts, rd (with homeWon, light/dark cur & next), hist (rounds -> { home, away }), now }
+     * st.econ[R][role] = { value, basis, at } once Onak has written it.
+     * Returns { actions: [{ op:'econ', side, role, value, round, basis, why }], info: [] }.
+     */
+    function decideEcon(ctx, st) {
+        const out = { actions: [], info: [] };
+        const rd = ctx.rd;
+        if (!ctx.opts.econ || !rd || !rd.running || rd.paused) return out;
+        const R = rd.round;
+        const done = st.econ[R] || (st.econ[R] = {});
+        const prev = ctx.hist && ctx.hist[R - 1];
+        for (const role of ['home', 'away']) {
+            const sideKey = (role === 'home') === rd.homeIsDark ? 'dark' : 'light';
+            const t = rd[sideKey];
+            const mine = done[role];
+            if (mine && mine.manual) continue;
+            // The trader set NEXT before Onak did, or changed what Onak wrote: his
+            // call stands. Right after a write Raiden still shows the old value
+            // until its echo arrives; that is not the trader, hence the grace.
+            const settling = mine && ctx.now - (mine.at || 0) < 4000;
+            if (t.next && t.next !== 'NONE' && (!mine || (econBuy(t.next) !== mine.value && !settling))) {
+                done[role] = Object.assign({}, mine || {}, { manual: true });
+                out.info.push(`R${R} ${role} next-round economy set by hand (${t.next}) — left as is`);
+                continue;
+            }
+            // What the team buys this round: Raiden's current round (Kano or the
+            // trader), else what was left as NEXT for it when it lost last round.
+            const cur = econBuy(t.cur) || (prev && prev[role] ? econBuy(prev[role].next) : null);
+            const v = econAfterLoss(role, R, rd.homeWon, cur);
+            if (!v) continue;
+            if (mine && mine.value === v.value) continue;                  // written, and still right
+            if (mine && mine.basis === (cur || '-')) continue;              // written on this basis already
+            out.actions.push({ op: 'econ', side: sideKey === 'dark' ? 'DARK' : 'LIGHT', role, value: v.value, round: R, basis: cur || '-', why: v.why });
+        }
+        return out;
+    }
+
     /*CORE-END*/
 
     // =====================================================================
@@ -901,6 +1321,7 @@
         routeTry: 0,
         bb: null, bbAt: 0, bbTabs: {}, bbTab: null, bbOpen: 0, bbMatches: 0,
         trace: [], traceSig: null,
+        econ: {},                   // clean-data key -> { rounds: { R: { home, away, homeWon } } }
         pm: null, pmAt: 0, pmLast: null, pmWins: [],
         cb: null, cbAt: 0, cbLast: null, cbWins: [],
         armed: false,
@@ -916,13 +1337,13 @@
     // a ReferenceError that takes the whole script down.
     let root = null, dirty = true;
     // relaxed only has an effect on the test host; production ignores it.
-    const OPT_DEFAULTS = { start: true, deaths: true, bomb: true, result: true, confirm: false, relaxed: true, pm: true, cb: true, suspend: true, checks: true };
+    const OPT_DEFAULTS = { start: true, deaths: true, bomb: true, result: true, confirm: false, confirmBb: false, relaxed: true, pm: true, cb: true, econ: false, suspend: true, checks: true };
     const OPTS = Object.assign({}, OPT_DEFAULTS, GM_getValue('onak:opts', {}) || {});
     // Validate on read: a stored key that no longer exists is dropped.
     Object.keys(OPTS).forEach(k => { if (!(k in OPT_DEFAULTS)) delete OPTS[k]; });
 
     function freshState() {
-        return { start: {}, plant: {}, result: {}, resultSeen: {}, confirm: {}, pending: {}, seen: {}, seenAt: {}, bbRoundFor: {}, bbDone: {}, autoClose: {}, refused: {}, pmGuess: {}, pmChecked: {}, switchRound: {} };
+        return { start: {}, plant: {}, result: {}, resultSeen: {}, confirm: {}, pending: {}, seen: {}, seenAt: {}, bbRoundFor: {}, bbDone: {}, autoClose: {}, refused: {}, pmGuess: {}, pmChecked: {}, switchRound: {}, econ: {} };
     }
 
     function logLine(msg, kind) {
@@ -1084,7 +1505,8 @@
 
     function teamOf(t) {
         t = t || {};
-        return { score: t.score, confirmed: t.scoreConfirmed, alive: t.numAlive };
+        return { score: t.score, confirmed: t.scoreConfirmed, alive: t.numAlive,
+            cur: t.equipmentTypeCurrentRound || null, next: t.equipmentTypeNextRound || null };
     }
 
     function onClean(d) {
@@ -1116,9 +1538,11 @@
             round: d.round, roundTime: d.roundTime, bomb: d.bomb, paused: !!d.paused,
             homeIsDark: L.homeIsDark[d.key] !== undefined ? L.homeIsDark[d.key] : !!d.homeIsDark,
             light: teamOf(d.lightTeam), dark: teamOf(d.darkTeam),
+            homeWon: Array.isArray(d.homeWon) ? d.homeWon : (prev && prev.key === d.key ? prev.homeWon : null),
             at: now, running: false,
         };
         refreshRunning(now);
+        recordEcon(L.rd);
         dirty = true;
         tick();
     }
@@ -1128,6 +1552,47 @@
     // stays there. 2.1.0 needed a tick in the last 2.6s, so when Raiden holds
     // the clock still (it parks it at 10) the round read as stopped and every
     // input stopped with it.
+    // Buy history per map, recorded whether the economy option is on or not:
+    // Raiden only shows this round's buys, so who bought what in earlier
+    // rounds - Kano's, the trader's, Onak's - is kept here, by team role
+    // (home/away) so the half-time side switch does not scramble it. Saved in
+    // Tampermonkey storage, so a reload keeps it.
+    const econKey = key => 'onak:econ:' + key;
+    function econHist(key) {
+        if (!L.econ[key]) L.econ[key] = GM_getValue(econKey(key), null) || { rounds: {} };
+        return L.econ[key];
+    }
+    function recordEcon(rd) {
+        if (!rd || !rd.key) return;
+        const h = econHist(rd.key);
+        const rec = h.rounds[rd.round] || (h.rounds[rd.round] = { home: {}, away: {} });
+        let changed = !h.rounds[rd.round].seen;
+        rec.seen = true;
+        for (const role of ['home', 'away']) {
+            const t = (role === 'home') === rd.homeIsDark ? rd.dark : rd.light;
+            const r = rec[role];
+            r.side = (role === 'home') === rd.homeIsDark ? 'T' : 'CT';
+            if (t.cur && t.cur !== 'NONE' && r.cur !== t.cur) { r.cur = t.cur; changed = true; }
+            if (t.next && r.next !== t.next) {
+                r.next = t.next;
+                const mine = ST.econ && ST.econ[rd.round] && ST.econ[rd.round][role];
+                r.by = mine && !mine.manual && econBuy(t.next) === mine.value ? 'onak' : (t.next === 'NONE' ? '' : 'raiden');
+                changed = true;
+            }
+        }
+        if (Array.isArray(rd.homeWon) && rd.homeWon.length === rd.round - 1) {
+            const w = rd.homeWon[rd.round - 2];
+            if (w !== undefined && h.rounds[rd.round - 1] && h.rounds[rd.round - 1].homeWon !== w) {
+                h.rounds[rd.round - 1].homeWon = w; changed = true;
+            }
+        }
+        if (changed) {
+            const ks = Object.keys(h.rounds).map(Number).sort((a, b) => a - b);
+            while (ks.length > 60) delete h.rounds[ks.shift()];
+            try { GM_setValue(econKey(rd.key), h); } catch (e) { /* storage full: kept in memory */ }
+        }
+    }
+
     function refreshRunning(now) {
         if (!L.rd) return;
         const latched = L.liveRound === L.rd.key + '#' + L.rd.round;
@@ -1306,6 +1771,7 @@
         plant: ['jadeUpdateTraderInputCsgoPlantBomb', 'CsgoPlantBombTraderInput', 'updateTraderInputCsgoPlantBomb'],
         result: ['jadeUpdateTraderInputCsgoRoundResult', 'CsgoRoundResultTraderInput', 'updateTraderInputCsgoRoundResult'],
         confirm: ['jadeUpdateTraderInputCsgoConfirmScore', 'CsgoConfirmScoreTraderInput', 'updateTraderInputCsgoConfirmScore'],
+        equip: ['jadeUpdateTraderInputCsgoEquipment', 'CsgoEquipmentTraderInput', 'updateTraderInputCsgoEquipment'],
     };
 
     async function mutate(kind, input, retried) {
@@ -1359,6 +1825,7 @@
                     if (a.op === 'result') { delete ST.result[a.round]; delete ST.pmGuess[a.round]; if (a.bbRound !== undefined) delete ST.bbDone[a.bbRound]; }
                     if (a.op === 'death') { delete ST.pending[a.side]; delete ST.autoClose[a.round]; if (a.bbRound !== undefined) delete ST.bbDone[a.bbRound]; }
                     if (a.op === 'confirm') delete ST.confirm[a.key];
+                    if (a.op === 'econ' && ST.econ[a.round]) delete ST.econ[a.round][a.role];
                     if (!L.authWait) {
                         L.authWait = Date.now();
                         logLine(`Raiden refused the credentials (${msg.split(': ').pop()}) — waiting for the page's new ones`, 'warn');
@@ -1407,10 +1874,16 @@
                 if (a.source === 'pm' || a.source === 'cb') ST.pmGuess[a.round] = a.type;
                 await mutate('result', { mapId, type: a.type });
                 logLine(`R${a.round} result ${a.type}${a.source === 'pm' ? ' (Polymarket)' : a.source === 'cb' ? ' (Cross.bet)' : ''}`, 'result');
+            } else if (a.op === 'econ') {
+                (ST.econ[a.round] || (ST.econ[a.round] = {}))[a.role] = { value: a.value, basis: a.basis, at: Date.now() };
+                await mutate('equip', { mapId, side: a.side, value: ECON_WRITE[a.value], type: 'NEXT_ROUND_AFTER_LOSS' });
+                const rt2 = L.routes[currentRoute().matchId];
+                const nm = rt2 ? rt2[a.role].name : a.role;
+                logLine(`R${a.round} economy if ${nm} (${a.side === 'LIGHT' ? 'CT' : 'T'}) loses: ${a.value} · ${a.why}`, 'econ');
             } else if (a.op === 'confirm') {
                 ST.confirm[a.key] = now;
                 await mutate('confirm', { mapId });
-                logLine(`score confirmed (${a.key.split(':').slice(1).join('-')} CT-T)`, 'confirm');
+                logLine(`score confirmed (${a.key.split(':').slice(1).join('-')} CT-T)${a.why ? ' · ' + a.why : ''}`, 'confirm');
             }
         }
     }
@@ -1490,6 +1963,7 @@
             cb: cbSource(),
             rt: rt || null,
             rdMapName,
+            matchNum: route.matchNum,
             authWaitMs: L.authWait ? now - L.authWait : 0,
             // 1.x panels used this id; if one is on the page, the old script
             // is still installed and would send inputs alongside this one.
@@ -1535,15 +2009,36 @@
             });
             if (L.trace.length > 1500) L.trace.shift();
         }
-        if (L.armed) processAlerts(res.alerts || [], now);
+        // Veto: works whether Onak is on or off (it writes nothing); its
+        // alerts join the others.
+        hintTick(now, route, rt); // eslint-disable-line no-use-before-define
+        const vs = vetoSteps(); // eslint-disable-line no-use-before-define
+        const vc = vetoCheck(vetoMaps(vs.steps), prematchList(route.matchId), rt);
+        L.veto = { via: vs.via, steps: vs.steps, check: vc, sources: vs.sources.map(x => ({ via: x.via, status: x.status, steps: x.steps.length })) };
+        const vetoAlerts = vc.issues.map(i => ({ key: i.key, level: 'notify', msg: i.msg, sticky: false }));
+        processAlerts((L.armed ? res.alerts || [] : []).concat(vetoAlerts), now);
         dirty = true;
         // A hold can still carry an action: Polymarket closing a round while
         // betboom holds. decide() only does that for betboom-side holds.
-        if (!res.actions.length || L.busy) return;
+        // Economy: independent of betboom and its holds; only needs Onak on, in
+        // charge of this map, with working credentials.
+        let econActs = [];
+        if (L.armed && L.leader && !L.error && !L.authWait && L.rd) {
+            const er = decideEcon({ opts: OPTS, rd: L.rd, hist: econHist(L.rd.key).rounds, now }, ST);
+            econActs = er.actions;
+            L.econInfo = er.info;
+        }
+        const acts = res.actions.concat(econActs);
+        if (!acts.length || L.busy) return;
         L.busy = true;
-        execute(res.actions)
+        execute(acts)
             .catch(e => { L.error = e.message || String(e); logLine('ERROR ' + L.error, 'error'); })
             .finally(() => { L.busy = false; dirty = true; });
+    }
+
+    function prematchList(matchId) {
+        const pre = L.prematch[matchId];
+        return pre ? Object.values(pre.maps).map(m => ({ order: m.order, name: m.name, homeIsDark: m.homeIsDark })) : [];
     }
 
     // ---- alerts -------------------------------------------------------------
@@ -1572,6 +2067,12 @@
         if (a.level === 'suspend' && OPTS.suspend && L.leader && L.rd && !L.suspended[a.key]) suspendMarkets(a);
         if (L.alertFired[a.key] && now - L.alertFired[a.key] < ALERT_COOLDOWN) return;
         L.alertFired[a.key] = now;
+        if (/^veto:/.test(a.key)) {
+            const gk = 'onak:vetonote:' + a.key;
+            const last = GM_getValue(gk, 0);
+            if (now - last < 30 * 60000) return;          // another tab already notified
+            GM_setValue(gk, now);
+        }
         beep(a.level === 'suspend');
         osNotify(`Dibu Onak — ${a.level === 'suspend' ? 'markets suspended' : 'check Raiden'}`, a.msg);
     }
@@ -1693,6 +2194,8 @@
             raiden: L.rd, betboom: L.bb, betboomTabs: Object.keys(L.bbTabs).length,
             polymarket: { link: getPmLink(), snapshot: L.pm, wins: L.pmWins }, // eslint-disable-line no-use-before-define
             crossbet: { pin: getCbLink(), pairing: GM_getValue(cbPairKey(), null), snapshot: L.cb, wins: L.cbWins }, // eslint-disable-line no-use-before-define
+            economy: L.rd ? econHist(L.rd.key) : null,
+            veto: L.veto || null,
             alerts: L.alerts, suspended: L.suspended,
             state: ST, lastDecision: L.last,
             log: L.log.map(l => ({ t: l.t.toISOString(), kind: l.kind, msg: l.msg })),
@@ -1754,7 +2257,10 @@
         const withMatch = live.filter(x => x.snap && x.snap.teams && x.snap.teams.length === 2);
         const route = currentRoute();
         const rt = L.routes[route.matchId];
-        const score = x => (autoMap(x.snap.teams, rt) ? 4 : 0) + (x.tab === L.bbTab ? 2 : 0);
+        // The Oddin match id (from the Dibu) is the strongest proof a tab is this
+        // Raiden match; then pairing by team names; then the tab already in use.
+        const score = x => (x.snap.oddinMatchId && String(x.snap.oddinMatchId) === String(route.matchNum) ? 8 : 0) +
+            (autoMap(x.snap.teams, rt) ? 4 : 0) + (x.tab === L.bbTab ? 2 : 0);
         const pool = withMatch.length ? withMatch : live;
         pool.sort((a, b) => (withMatch.length ? score(b) - score(a) : 0) || b.at - a.at);
         return { pick: pool[0] || null, open: live.length, matches: withMatch.length };
@@ -1805,6 +2311,86 @@
         dirty = true;
         tick();
     }
+
+    // ---- Veto -------------------------------------------------------------
+    // Raiden never connects to GRID itself (3.7.1): a WebSocket carries the
+    // page's origin, and from here that origin is Oddin's own domain. The veto
+    // arrives from tabs where the connection looks like the site's own:
+    //   - the Polymarket event page, where Onak reads GRID's live log as the
+    //     page itself does ('onak:veto');
+    //   - the Dibu on betboom, through betboom's own GRID proxy (in the bb
+    //     snapshot), experimental.
+    // The source with the most steps for this series wins.
+    const G = { tab: null };
+    const vetoSeriesId = () => (typeof PMD !== 'undefined' && PMD.seriesId) || (L.pm && L.pm.seriesId) || null; // eslint-disable-line no-use-before-define
+    const vetoMatchKey = () => `onak:vetomatch:${ENV.name}:${currentRoute().matchNum || '?'}`;
+    function vetoSources() {
+        let sid = vetoSeriesId();
+        const bvx = L.bb && L.bb.veto;
+        if (!sid && bvx && bvx.seriesId && bvx.steps && bvx.steps.length) sid = bvx.seriesId;
+        if (!sid) sid = GM_getValue(vetoMatchKey(), null);          // read before, sources closed now
+        const out = [];
+        const t = G.tab;
+        if (t && (!sid || t.seriesId === sid) && Date.now() - (t.at || 0) < 20000) {
+            out.push({ via: 'Polymarket tab', status: t.status, steps: t.steps || [], seriesId: t.seriesId });
+        }
+        const bv = L.bb && L.bb.veto;
+        if (bv && bv.seriesId && (!sid || bv.seriesId === sid)) {
+            out.push({ via: 'betboom (Dibu)', status: bv.status, steps: bv.steps || [], seriesId: bv.seriesId });
+        }
+        const saved = sid ? GM_getValue('onak:vetocache:' + sid, null) : null;
+        if (saved && Array.isArray(saved.steps) && saved.steps.length) {
+            out.push({ via: `saved (read ${hhmm(saved.at)} via ${saved.via})`, status: 'saved', steps: saved.steps, seriesId: sid, saved: true });
+        }
+        return out;
+    }
+    // Keep the best veto seen for this series, and which series this Raiden
+    // match uses: a reload, a late switch-on or a closed source still shows it.
+    function vetoRemember(steps, via, sid) {
+        if (!sid || !steps.length) return;
+        const saved = GM_getValue('onak:vetocache:' + sid, null);
+        if (!saved || (saved.steps || []).length < steps.length) {
+            GM_setValue('onak:vetocache:' + sid, { at: Date.now(), via, steps });
+        }
+        if (GM_getValue(vetoMatchKey(), null) !== sid) GM_setValue(vetoMatchKey(), sid);
+    }
+    function vetoSteps() {
+        const srcs = vetoSources();
+        // Live sources first on equal length, the saved copy only fills gaps.
+        const best = srcs.slice().sort((a, b) => (b.steps.length - a.steps.length) || ((a.saved ? 1 : 0) - (b.saved ? 1 : 0)))[0];
+        if (best && !best.saved) vetoRemember(best.steps, best.via, best.seriesId);
+        return { steps: best ? best.steps : [], via: best && best.steps.length ? best.via : null, sources: srcs };
+    }
+    // Tell the Dibu which GRID series this match is, when Raiden knows it (the
+    // Polymarket link) and betboom does not yet: only for betboom tabs paired
+    // with this Raiden match by the Oddin id, or by both team names.
+    function hintTick(now, route, rt) {
+        const sid = vetoSeriesId();
+        if (!sid || !rt) return;
+        const hints = {};
+        Object.values(L.bbTabs).forEach(x => {
+            const sn = x.snap;
+            if (!sn || !sn.matchId || now - x.at > 15000) return;
+            if (sn.veto && sn.veto.seriesId) return;
+            const same = sn.oddinMatchId ? String(sn.oddinMatchId) === String(route.matchNum) : null;
+            if (same === false) return;
+            const names = (sn.teams && sn.teams.length === 2 ? sn.teams.map(t => t.name) : (sn.metaTeams || [])).map(name => ({ name }));
+            const byName = names.length === 2 && !!(pmTeamMap(names, [{ name: rt.home.name }, { name: rt.away.name }]) ||
+                pmTeamMap(names, [{ name: rt.home.short }, { name: rt.away.short }]));
+            if (same || byName) hints[sn.matchId] = sid;
+        });
+        if (!Object.keys(hints).length) return;
+        const cur = GM_getValue('onak:hint', null);
+        const merged = Object.assign({}, cur && now - (cur.at || 0) < 10 * 60000 ? cur.hints : {}, hints);
+        if (!cur || JSON.stringify(cur.hints) !== JSON.stringify(merged) || now - cur.at > 60000) {
+            GM_setValue('onak:hint', { at: now, hints: merged });
+        }
+    }
+
+    try {
+        GM_addValueChangeListener('onak:veto', (k, o, v) => { G.tab = v; dirty = true; });
+        G.tab = GM_getValue('onak:veto', null);
+    } catch (e) { /* noop */ }
 
     // ---- Cross.bet source ----------------------------------------------------
     // Pinned per Raiden match by pasting the cross.bet match link (only that
@@ -2069,7 +2655,7 @@
 #dl-log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #dl-log .death{color:#eb9a7a}#dl-log .start{color:#7fe0a8}#dl-log .bomb{color:#f0c46a}
 #dl-log .result{color:#9cc4ff}#dl-log .hold,#dl-log .warn{color:#c9a75a}#dl-log .error{color:#ff8f95}
-#dl-log .confirm{color:#b4a0f0}#dl-log .pm{color:#7ad0d6}
+#dl-log .confirm{color:#b4a0f0}#dl-log .pm{color:#7ad0d6}#dl-log .econ{color:#c8d67a}
 .dl-btns{display:flex;gap:6px;margin-top:7px}
 .dl-test{background:#1d242c;color:#f0c46a;border:1px solid #5a4a22;border-radius:4px;font-size:10px;cursor:pointer;padding:3px 9px}
 .dl-test:hover{border-color:#f0c46a}
@@ -2091,7 +2677,7 @@
     // Tabs: Live is what is watched during a match; Setup is used once per
     // match; Options and Log are occasional. The status line and the alerts
     // sit above the tabs, so they are visible whichever tab is open.
-    const TABS = [['live', 'LIVE'], ['setup', 'SETUP'], ['options', 'OPTIONS'], ['log', 'LOG']];
+    const TABS = [['live', 'LIVE'], ['setup', 'SETUP'], ['veto', 'VETO'], ['options', 'OPTIONS'], ['log', 'LOG']];
     const UI = { tab: 'live', logFilter: 'all', logSeen: 0 };
 
     function buildPanel() {
@@ -2217,11 +2803,15 @@
             ['deaths', 'Deaths', 'Marks each side\u2019s deaths'],
             ['bomb', 'Bomb', 'Plants the bomb'],
             ['result', 'Round end', 'Closes the round with its type'],
-            ['confirm', 'Confirm score', 'Confirms the point Onak just set'],
+            ['confirm', 'Confirm own points', 'Confirms the point Onak just set'],
+            ['confirmBb', 'Confirm when bb agrees', 'Confirms Raiden\u2019s score, whoever set it, once bb shows the same'],
         ]],
         ['SOURCES', 'the first to score closes the round', [
             ['pm', 'Polymarket score', 'Closes the round as soon as Polymarket scores it'],
             ['cb', 'Cross.bet score', 'Same, from an open cross.bet match tab'],
+        ]],
+        ['ECONOMY', 'history is always recorded', [
+            ['econ', 'Next-round economy', 'Sets NEXT ROUND (after loss) for both teams once the round is live; never the current round or Confirm buy'],
         ]],
         ['SAFETY', '', [
             ['suspend', 'Auto-suspend', 'Suspends on wrong map, sides or score; never reopens'],
@@ -2232,7 +2822,7 @@
         ['checks', 'Check map & sides', 'Still suspends on wrong map or sides in test'],
     ]];
     const LOG_KINDS = {
-        actions: ['death', 'start', 'bomb', 'result', 'confirm', 'pm'],
+        actions: ['death', 'start', 'bomb', 'result', 'confirm', 'pm', 'econ'],
         alerts: ['error', 'warn', 'hold'],
     };
 
@@ -2298,12 +2888,15 @@
         const unseen = L.log.slice(UI.logSeen).some(l => LOG_KINDS.alerts.indexOf(l.kind) >= 0);
         root.querySelectorAll('.dl-tab').forEach(b => {
             let dot = b.querySelector('.dot');
+            const vIssues = L.veto && L.veto.check.issues.length;
             const want = b.dataset.tab === 'setup' ? (unpaired ? 'red' : (noPm ? 'amber' : ''))
-                : b.dataset.tab === 'log' ? (unseen ? 'red' : '') : '';
+                : b.dataset.tab === 'log' ? (unseen ? 'red' : '')
+                : b.dataset.tab === 'veto' ? (vIssues ? 'red' : '') : '';
             if (!want) { if (dot) dot.remove(); return; }
             if (!dot) { dot = el('span', 'dot'); b.appendChild(dot); }
             dot.className = 'dot' + (want === 'red' ? ' red' : '');
-            dot.title = b.dataset.tab === 'setup' ? (unpaired ? 'teams not paired' : 'no Polymarket source') : 'new warnings in the log';
+            dot.title = b.dataset.tab === 'setup' ? (unpaired ? 'teams not paired' : 'no Polymarket source')
+                : b.dataset.tab === 'veto' ? 'veto does not match the prematch table' : 'new warnings in the log';
         });
 
         // ================= LIVE =================
@@ -2344,7 +2937,8 @@
             rt ? '' : (L.routeWhy ? 'teams unavailable' : 'teams loading…'));
         if (bb && bb.teams && bb.teams.length) {
             const quiet = bb.lastUpdate ? Math.round((now - bb.lastUpdate) / 1000) : null;
-            line(`bb map ${bb.mapNum || '?'} · R${bbRoundOf(bb)} · ${bb.phase || '—'}` + (L.bbOpen > 1 ? ` · ${L.bbOpen} bb tabs` : ''),
+            const same = bb.oddinMatchId ? (String(bb.oddinMatchId) === String(route.matchNum) ? ' · same match ✓' : ' · OTHER MATCH') : '';
+            line(`bb map ${bb.mapNum || '?'} · R${bbRoundOf(bb)} · ${bb.phase || '—'}${same}` + (L.bbOpen > 1 ? ` · ${L.bbOpen} bb tabs` : ''),
                 `${bb.latency ? bb.latency.toFixed(1) + 's' : ''}${quiet !== null && quiet >= 5 ? ` · quiet ${quiet}s` : ''}`,
                 bb.latency > LAG_ON ? 'dl-bad' : '');
         } else line('bb —', '');
@@ -2360,6 +2954,10 @@
             mapMark = ok ? '✓' : '✗ mismatch'; mapCls = ok ? 'dl-good' : 'dl-bad';
         }
         line(`map ${rdOrder || '?'} · Raiden ${rdName || '?'} · bb ${bbName ? (bb.mapNum ? bb.mapNum + ' ' : '') + bbName : '?'}`, mapMark, mapCls);
+        if (rd && rd.light && (rd.light.cur || rd.light.next)) {
+            const ec = (t, s) => `${s} ${(t.cur && t.cur !== 'NONE' ? t.cur : '—').replace('FULL_BUY', 'FULL')}→${(t.next && t.next !== 'NONE' ? t.next : '—').replace('FULL_BUY', 'FULL')}`;
+            line(`eco now→if lost · ${ec(rd.light, 'CT')} · ${ec(rd.dark, 'T')}`, OPTS.econ ? 'auto' : 'off', OPTS.econ ? 'dl-good' : '');
+        }
         if (OPTS.cb && L.cb) {
             const age = Math.round((now - L.cbAt) / 1000);
             const c = L.cb;
@@ -2386,7 +2984,7 @@
         const manual = (bb && GM_getValue(key, null)) || {};
         const auto = (bb && autoMap(bb.teams, rt)) || {};
         const pairSig = JSON.stringify([relaxedNow, key, bb && bb.teams && bb.teams.map(t => [t.id, t.name]),
-            rt && [rt.home.name, rt.away.name], manual, auto]);
+            rt && [rt.home.name, rt.away.name], manual, auto, bb && bb.oddinMatchId, route.matchNum]);
         rebuildIf(pair, pairSig, box => {
             if (relaxedNow) {
                 box.appendChild(el('div', 'dl-sec', 'PAIRING'));
@@ -2398,6 +2996,14 @@
                 box.appendChild(el('div', 'dl-note', 'Waiting for the Dibu tab…'));
                 return;
             }
+            // Which betboom match these names come from (the one open in the
+            // Dibu), and whether it is this Raiden match: the Polymarket link
+            // does not change this section.
+            const other = bb.oddinMatchId && String(bb.oddinMatchId) !== String(route.matchNum);
+            const src = el('div', other ? 'dl-bad' : 'dl-note',
+                `betboom tab: ${bb.teams.map(t => t.name).join(' vs ')}` +
+                (bb.oddinMatchId ? (other ? ' — another match: open this one in the Dibu' : ' · same match ✓') : ''));
+            box.appendChild(src);
             bb.teams.forEach(t => {
                 const row = el('div', 'dl-map');
                 row.appendChild(el('span', '', t.name));
@@ -2524,6 +3130,53 @@
                 pr.appendChild(sel);
                 box.appendChild(pr);
             }
+        });
+
+        // ================= VETO =================
+        const vbox = section(pane('veto'), 'veto');
+        const V = L.veto || { steps: [], sources: [], check: { rows: [], issues: [] } };
+        const vSig = JSON.stringify([V.via, V.sources, V.steps.map(x => x.id), V.check.rows, V.check.issues]);
+        rebuildIf(vbox, vSig, box => {
+            const live = V.sources.filter(x => x.status === 'open' || x.status === 'live' || x.status === 'complete');
+            const st = V.steps.length ? `${V.steps.length} veto steps · via ${V.via}`
+                : live.length ? `Connected via ${live.map(x => x.via).join(' + ')} — no veto yet`
+                : V.sources.length ? `Waiting for GRID (${V.sources.map(x => `${x.via}: ${x.status}`).join(' · ')})`
+                : 'Open the Polymarket event page, or this match in the Dibu (betboom), to read the veto';
+            box.appendChild(el('div', 'dl-note', st));
+            if (V.sources.length) box.appendChild(el('div', 'dl-note', 'sources: ' + V.sources.map(x => `${x.via} ${x.status} (${x.steps})`).join(' · ')));
+            if (V.steps.length) {
+                const cp = el('button', 'dl-test', '⧉ copy veto');
+                cp.title = 'Copy the veto steps as text, one per line';
+                cp.addEventListener('click', () => { copyToClipboard(vetoText(V.steps)); cp.textContent = '✓ copied'; setTimeout(() => { cp.textContent = '⧉ copy veto'; }, 1500); });
+                box.appendChild(cp);
+            }
+            if (!V.steps.length) return;
+            box.appendChild(el('div', 'dl-sec', 'STEPS'));
+            const act = { ban: 'banned', pick: 'picked', decider: 'decider', side: 'chose' };
+            const col = { ban: '#ff8f95', pick: '#7fe0a8', decider: '#f0c46a', side: '#b4a0f0' };
+            V.steps.forEach(v => {
+                const r = el('div', 'dl-meta');
+                const left = el('span', '');
+                left.append(el('span', '', (v.ts ? hhmm(Date.parse(v.ts)) : '') + '  '), el('b', '', v.team + ' '));
+                const a = el('span', '', act[v.action] + ' '); a.style.color = col[v.action]; left.appendChild(a);
+                left.append(v.action === 'side' ? `${v.side} on ${v.map}` : v.map);
+                r.appendChild(left); r.appendChild(el('span', '', ''));
+                box.appendChild(r);
+            });
+            box.appendChild(el('div', 'dl-sec', 'MAPS vs RAIDEN PREMATCH'));
+            V.check.rows.forEach(row => {
+                const r = el('div', 'dl-meta');
+                const sideTxt = row.sides.length ? ' · ' + row.sides.map(x => `${x.team} ${x.side}`).join(', ') : (row.by === 'decider' ? ' · decider' : '');
+                r.appendChild(el('span', '', `${row.seq}. ${row.map}${sideTxt}`));
+                const bits = [];
+                if (row.mapOk === true) bits.push('map ✓'); else if (row.mapOk === false) bits.push(`✗ ${row.rdName}`); else bits.push('map ?');
+                if (row.side) bits.push(row.side.ok === true ? 'side ✓' : row.side.ok === false ? 'side ✗' : (row.side.have === null ? 'side not set' : 'side ?'));
+                const bad = row.mapOk === false || (row.side && row.side.ok === false);
+                r.appendChild(el('span', bad ? 'dl-bad' : (row.mapOk ? 'dl-good' : ''), bits.join(' · ')));
+                box.appendChild(r);
+            });
+            V.check.issues.forEach(i => box.appendChild(el('div', 'dl-bad', '⚠ ' + i.msg.replace(/^veto: /, ''))));
+            if (!V.check.rows.some(r => r.rdName)) box.appendChild(el('div', 'dl-note', 'Raiden prematch table not read yet.'));
         });
 
         // ================= OPTIONS =================
