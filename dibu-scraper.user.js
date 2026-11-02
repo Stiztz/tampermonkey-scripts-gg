@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dibu Scraper (CS2)
 // @namespace    https://github.com/Stiztz/tampermonkey-scripts-gg
-// @version      1.12.4
+// @version      1.12.5
 // @description  bb scraper
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=oddin.gg
 // @author       GG
@@ -2114,6 +2114,13 @@
 .mh-top.mh-drag{cursor:grabbing}
 .mh-brand{font-weight:700;letter-spacing:.13em;text-transform:uppercase;font-size:9.5px;color:#dfe9f7;flex:none}
 .mh-brand b{color:#4a9eff}
+.mh-ids{display:flex;gap:4px;flex:none;align-items:center}
+.mh-id{font-size:9.5px;color:#7f93ad;background:#0b1422;border:1px solid #1f3048;border-radius:3px;padding:1px 5px;cursor:pointer;white-space:nowrap}
+.mh-id b{color:#cfe0f5;font-weight:600;margin-left:3px}
+.mh-id.grid b{color:#c9a3ff}
+.mh-id.none{opacity:.55}
+.mh-id:hover{border-color:#4a9eff}
+.mh-id.ok{border-color:#2f7a52}
 .mh-title{flex:1;font-size:11.5px;font-weight:600;color:#e8f0fb;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
 .mh-stale{flex:none;font-size:9px;font-weight:700;color:#0d1420;background:#d4a340;
@@ -2406,6 +2413,7 @@
       <div class="mh-top" id="mh-top">
         <div class="mh-brand">Dibu <b>Scraper</b></div>
         <div class="mh-title" id="mh-title">Waiting for data…</div>
+        <div class="mh-ids" id="mh-ids"></div>
         <div class="mh-stale" id="mh-stale" style="display:none"></div>
         <div class="mh-flash" id="mh-flash" style="display:none"></div>
         <div class="mh-lat" id="mh-lat" style="display:none"></div>
@@ -3642,11 +3650,44 @@
         }
     }
 
+    // The ids of the match on screen - betboom, Raiden (Oddin) and GRID series -
+    // each copied with a click. GRID's tooltip says where the id came from.
+    function renderIds() {
+        const box = root.querySelector('#mh-ids');
+        if (!box) return;
+        const bb = S.active ? String(S.active) : null;
+        const raiden = bb ? S.oddinByMatch.get(bb) || null : null;
+        const grid = activeSeries();
+        const src = bb ? S.seriesSrc.get(bb) : null;
+        const sig = JSON.stringify([bb, raiden, grid, src]);
+        if (box.dataset.sig === sig) return;
+        box.dataset.sig = sig;
+        box.textContent = '';
+        if (!bb) return;
+        const chip = (label, val, cls, title) => {
+            const c = el('span', 'mh-id ' + cls + (val ? '' : ' none'));
+            c.append(label); c.appendChild(el('b', '', val || '?'));
+            c.title = val ? `${title} — click to copy` : title;
+            c.addEventListener('mousedown', ev => ev.stopPropagation());
+            c.addEventListener('click', ev => {
+                ev.stopPropagation();
+                if (!val) return;
+                copyText(val);
+                c.classList.add('ok'); setTimeout(() => c.classList.remove('ok'), 900);
+            });
+            box.appendChild(c);
+        };
+        chip('bb', bb, 'bb', 'betboom match id');
+        chip('Raiden', raiden, 'rd', raiden ? 'Oddin match id = the Raiden match number' : 'Oddin / Raiden match id not known yet (from betboom\u2019s match details)');
+        chip('GRID', grid, 'grid', grid ? `GRID series id (from ${src || 'the game feed'})` : 'GRID series id not known yet — paste it in the Veto card, or open the Polymarket event with Onak');
+    }
+
     // ---------- master render ----------
     function render() {
         if (!root || !S.open) return;
         const g = S.active ? S.games.get(S.active) : null;
         const meta = S.active ? S.matches.get(S.active) : null;
+        renderIds();
 
         const title = root.querySelector('#mh-title');
         if (g && g.teams.length === 2) {
