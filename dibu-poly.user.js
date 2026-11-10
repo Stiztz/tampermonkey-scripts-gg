@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         DibuPoly
 // @namespace    DibuVerse
-// @version      0.10.2
+// @version      0.10.3
 // @description  Polymarket scraper
 // @author       Dibujito
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=polymarket.com
 // @match        *://polymarket.com/*
 // @match        *://*.polymarket.com/*
+// @updateURL    https://github.com/Stiztz/tampermonkey-scripts-gg/raw/refs/heads/main/dibu-poly.user.js
+// @downloadURL  https://github.com/Stiztz/tampermonkey-scripts-gg/raw/refs/heads/main/dibu-poly.user.js
 // @connect      gamma-api.polymarket.com
 // @grant        unsafeWindow
 // @run-at       document-start
@@ -756,5 +758,5 @@
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onReady); else onReady();
   W.__pmR6 = { state: S, export: buildExport };
-  console.log(TAG, 'v0.10.2 installed (Ctrl+Shift+R toggles)');
+  console.log(TAG, 'v0.10.3 installed (Ctrl+Shift+R toggles)');
 })();
