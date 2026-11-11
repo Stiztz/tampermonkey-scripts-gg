@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DibuPoly
 // @namespace    DibuVerse
-// @version      0.10.3
+// @version      0.10.4
 // @description  Polymarket scraper
 // @author       Dibujito
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=polymarket.com
@@ -354,6 +354,45 @@
     return maps.map((m, i) => ({ seq: i + 1, ...m }));
   }
 
+  // ---------------------------------------------------------------- who is alive (from the live log)
+  // GRID's fast feed gives HP for R6 but nothing of the kind for CS2: its team_scoreboard is
+  // K/D/A only (export of 10 Nov), so a dead player looked exactly like a live one. The live
+  // log does say who died: "[killer] killed [victim]" and "[player] committed suicide", each
+  // player chunk with the same entityId the scoreboard uses. Dead this round = every victim
+  // since the last "Round N started". Same feed, same delay as the rest of this section.
+  function killOf(e) {
+    const ch = e && e.sentenceChunks; if (!ch || ch.length < 2 || e.eventCategory !== 'Kills') return null;
+    const key = (ch[1].textTranslation && ch[1].textTranslation.key) || String(ch[1].text || '').toLowerCase().replace(/\s+/g, '_');
+    if (key === 'killed' && ch[2]) return { k: ch[0].entityId || null, kn: String(ch[0].text || ''), v: ch[2].entityId || null, vn: String(ch[2].text || '') };
+    if (key === 'committed_suicide') return { k: null, kn: '', v: ch[0].entityId || null, vn: String(ch[0].text || '') };
+    return null;
+  }
+  // log: S.log in time order. Returns { known, dead: key -> killer name, kills: killer id -> n };
+  // a player's key is its id, or "n:<name>" when the entry carried no id.
+  function roundState(log) {
+    const dead = new Map(), kills = new Map(); let start = -1;
+    for (let i = log.length - 1; i >= 0; i--) if (/^Round \d+ started$/.test(log[i].text)) { start = i; break; }
+    if (start < 0) return { known: false, dead, kills };
+    for (let i = start + 1; i < log.length; i++) {
+      const k = log[i].kill; if (!k) continue;
+      dead.set(k.v || 'n:' + k.vn.toLowerCase(), k.kn);
+      if (k.k) kills.set(k.k, (kills.get(k.k) || 0) + 1);
+    }
+    return { known: true, dead, kills };
+  }
+  const isDead = (rs, p) => rs.dead.has(p.id) || rs.dead.has('n:' + String(p.name || '').toLowerCase());
+  // Side labels as GRID writes them: "CT" / "T" for CS2 (also "counter-terrorist" on a player),
+  // "ATK" / "DEF" for R6. Up to 0.10.3 everything that was not DEF was shown as ATK, so in CS2
+  // both teams read ATK.
+  function sideOf(txt) {
+    const t = String(txt || '').trim(); if (!t) return '';
+    if (/^(ct|counter)/i.test(t)) return 'CT';
+    if (/^(t|terrorists?)$/i.test(t)) return 'T';
+    if (/def/i.test(t)) return 'DEF';
+    if (/atk|attack/i.test(t)) return 'ATK';
+    return t.toUpperCase().slice(0, 4);
+  }
+
   function handleService(service, d) {
     const t = now();
     if (service === 'series_scoreboard_v2') { S.scoreboard = { ...d, t }; const g = (d.games || [])[d.activeGameIndex || 0]; if (g && g.gameClock) { S.clock = { seconds: g.gameClock.currentSeconds, ticking: !!g.gameClock.isTicking, backwards: !!g.gameClock.tickingBackwards, recvT: t }; if (g.gameClock.occurredAt) addDelaySample(g.gameClock.occurredAt); } if (g && Array.isArray(g.momentum)) { const act = g.momentum.find(m => m.active && /^\d+$/.test(m.contentText || '')); if (act) S.delayedRound = +act.contentText; } }
@@ -364,7 +403,7 @@
       let vetoNew = false;
       for (const e of entries) { const v = parseVeto(e); if (v && !S.veto.some(x => x.id === v.id)) { S.veto.push(v); vetoNew = true; } }
       if (vetoNew) { S.veto.sort((a, b) => (a.ts || '').localeCompare(b.ts || '')); saveVeto(); }
-      for (const e of entries) { if (S.log.some(x => x.id === e.id)) continue; const text = (e.sentenceChunks || []).map(c => c.text).join(' '); S.log.push({ t, ts: e.timestamp, gameTime: e.gameTime, cat: e.eventCategory, text, id: e.id }); const m = /^Round (\d+) started$/.exec(text); if (m) S.delayedRound = +m[1]; if (fresh && e.timestamp) addDelaySample(e.timestamp); }
+      for (const e of entries) { if (S.log.some(x => x.id === e.id)) continue; const text = (e.sentenceChunks || []).map(c => c.text).join(' '); const rec = { t, ts: e.timestamp, gameTime: e.gameTime, cat: e.eventCategory, text, id: e.id }; const kill = killOf(e); if (kill) rec.kill = kill; S.log.push(rec); const m = /^Round (\d+) started$/.exec(text); if (m) S.delayedRound = +m[1]; if (fresh && e.timestamp) addDelaySample(e.timestamp); }
       if (S.log.length > 800) S.log.splice(0, S.log.length - 800); if (!fresh) S.log.sort((a, b) => (a.ts || '').localeCompare(b.ts || ''));
     }
   }
@@ -483,13 +522,13 @@
       #pm-r6 .num{font-size:26px;font-weight:bold;color:#3fb950;text-align:center;white-space:nowrap}#pm-r6 .blk-del .num{color:#ffa657}
       #pm-r6 .round{text-align:center;font-size:12px;color:#8b949e;margin:2px 0}#pm-r6 .round b{color:#c9d1d9;font-size:15px}
       #pm-r6 .pmodds{display:grid;grid-template-columns:1fr 1fr;margin-top:4px;padding-top:4px;border-top:1px dashed #30363d}#pm-r6 .pmodds .o{text-align:center}#pm-r6 .pmodds .o b{font-size:16px}#pm-r6 .pmodds .o small{color:#8b949e}
-      #pm-r6 .side{font-size:10px;padding:0 4px;border-radius:3px;margin:0 4px;vertical-align:middle}.side-DEF{background:#1f6feb;color:#fff}.side-ATK{background:#d29922;color:#000}
+      #pm-r6 .side{font-size:10px;padding:0 4px;border-radius:3px;margin:0 4px;vertical-align:middle}.side-DEF{background:#1f6feb;color:#fff}.side-ATK{background:#d29922;color:#000}#pm-r6 .side-CT{background:#4A71D4;color:#fff}#pm-r6 .side-T{background:#EEB730;color:#000}#pm-r6 .side-X{background:#30363d;color:#c9d1d9}
       #pm-r6 .dim{color:#8b949e}#pm-r6 .ok{color:#3fb950}#pm-r6 .bad{color:#ff7b72}
       #pm-r6 .ev{max-height:80px;overflow:auto;margin-top:4px;padding-top:4px;border-top:1px dashed #30363d}#pm-r6 .ev .end{color:#3fb950;font-weight:bold}.ev .map{color:#d2a8ff;font-weight:bold}.ev .info{color:#8b949e}.ev .gamma{color:#79c0ff}
       #pm-r6 .tabs{display:flex;gap:4px;margin:4px 0}#pm-r6 .tabs button{font-size:11px}
       #pm-r6 table{width:100%;border-collapse:collapse;table-layout:fixed}#pm-r6 td,#pm-r6 th{padding:2px 4px;border-bottom:1px dashed #21262d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
       #pm-r6 th{color:#8b949e;font-weight:normal;text-align:left}#pm-r6 .c{text-align:center}#pm-r6 .rr{text-align:right}#pm-r6 tr.team td{font-weight:bold;background:#ffffff08}
-      #pm-r6 .dead{color:#6e7681}#pm-r6 .hpw{display:inline-flex;align-items:center;gap:4px;justify-content:flex-end;width:100%}#pm-r6 .hp{display:inline-block;width:36px;height:6px;background:#21262d;border-radius:3px;overflow:hidden}#pm-r6 .hp i{display:block;height:100%}#pm-r6 .hpn{display:inline-block;width:26px;text-align:right}
+      #pm-r6 td.pn{font-weight:bold;color:#f0f6fc}#pm-r6 tr.dead td{color:#6e7681;font-weight:normal;opacity:.7}#pm-r6 tr.dead .vct,#pm-r6 tr.dead .vt{color:inherit;font-weight:normal}#pm-r6 .st{white-space:nowrap}#pm-r6 .hpw{display:inline-flex;align-items:center;gap:4px;justify-content:flex-end;width:100%}#pm-r6 .hp{display:inline-block;width:36px;height:6px;background:#21262d;border-radius:3px;overflow:hidden}#pm-r6 .hp i{display:block;height:100%}#pm-r6 .hpn{display:inline-block;width:26px;text-align:right}
       #pm-r6 .fold{display:flex;justify-content:space-between;align-items:center;margin-top:6px;padding:3px 6px;background:#ffffff0a;border-radius:4px;cursor:pointer;user-select:none}
       #pm-r6 .log{max-height:160px;overflow:auto;margin-top:4px}#pm-r6 .log .Kills{color:#ff7b72}.log .General{color:#3fb950;font-weight:bold}.log .Other{color:#8b949e}.log .Objectives{color:#ffa657}
       #pm-r6 .cap{display:flex;justify-content:space-between;color:#8b949e}
@@ -627,7 +666,7 @@
     window.addEventListener('beforeunload', () => { try { w.close(); } catch {} }); render();
   }
   function render() { if (renderQueued) return; renderQueued = true; requestAnimationFrame(() => { renderQueued = false; paint(); }); }
-  const sideTag = (txt) => txt ? `<span class="side side-${/DEF/i.test(txt) ? 'DEF' : 'ATK'}">${/DEF/i.test(txt) ? 'DEF' : 'ATK'}</span>` : '';
+  const sideTag = (txt) => { const sd = sideOf(txt); return sd ? `<span class="side side-${/^(CT|T|DEF|ATK)$/.test(sd) ? sd : 'X'}">${esc(sd)}</span>` : ''; };
   const colorOf = (id) => (S.colors[id] && S.colors[id].sideColor) || '#c9d1d9';
   const nameCls = (n) => (n || '').length > 20 ? 'xlong' : (n || '').length > 13 ? 'long' : '';
   const shortName = (n) => (n || '').replace(/\s+(Alienware|Esports|E-?sports|Gaming|Team)$/i, '').slice(0, 14);
@@ -708,15 +747,34 @@
     if (!sb && !tb) dHead = `<div class="dim">${S.gridStatus === 'idle' ? 'waiting for seriesId…' : 'no widget data yet (' + esc(S.gridStatus) + ')'}</div>`;
     else {
       const g = sb && (sb.games || [])[sb.activeGameIndex || 0]; let clockTxt = '';
+      // A team's colour is its side's. CS2: taken from the side label itself (CT blue, T yellow,
+      // the HUD's own two colours), so name and tag always agree and switch in the same frame.
+      // Other games keep GRID's team_colors as before, then the scoreboard's own side colour.
+      const sideColor = (gt) => { if (!gt) return '#c9d1d9'; const sd = sideOf(gt.infoText && gt.infoText.text); if (sd === 'CT') return '#58a6ff'; if (sd === 'T') return '#e3b341'; const c = S.colors[gt.id] && S.colors[gt.id].sideColor; if (c) return c; const ic = gt.infoText && gt.infoText.color; return /^#[0-9a-f]{3,8}$/i.test(ic || '') ? ic : '#c9d1d9'; };
       if (S.clock) { let sec = S.clock.seconds; if (S.clock.ticking) { const el = (now() - S.clock.recvT) / 1000; sec = S.clock.backwards ? sec - el : sec + el; } clockTxt = `⏱ ${mmss(sec)}${S.clock.ticking ? '' : ' (paused)'}`; }
-      if (g) { const [a, b] = g.teams; const nm = (id) => (S.teamsBoard?.teams || sb.series?.teams || []).find(x => x.id === id)?.name || id; dHead = `<div class="score"><span class="tn r ${nameCls(nm(a.id))}" style="color:${colorOf(a.id)}">${esc(nm(a.id))}${sideTag(a.infoText?.text)}</span><span class="num">${a.score} : ${b.score}</span><span class="tn ${nameCls(nm(b.id))}" style="color:${colorOf(b.id)}">${sideTag(b.infoText?.text)}${esc(nm(b.id))}</span></div><div class="round"><b>ROUND ${S.delayedRound ?? (a.score + b.score + 1)}</b> · ${esc(g.centeredInfoText || g.mapName || '')} · <b>${clockTxt}</b> · ${esc(g.status || '')}</div>`; }
+      if (g) { const [a, b] = g.teams; const nm = (id) => (S.teamsBoard?.teams || sb.series?.teams || []).find(x => x.id === id)?.name || id; dHead = `<div class="score"><span class="tn r ${nameCls(nm(a.id))}" style="color:${sideColor(a)}">${esc(nm(a.id))}${sideTag(a.infoText?.text)}</span><span class="num">${a.score} : ${b.score}</span><span class="tn ${nameCls(nm(b.id))}" style="color:${sideColor(b)}">${sideTag(b.infoText?.text)}${esc(nm(b.id))}</span></div><div class="round"><b>ROUND ${S.delayedRound ?? (a.score + b.score + 1)}</b> · ${esc(g.centeredInfoText || g.mapName || '')} · <b>${clockTxt}</b> · ${esc(g.status || '')}</div>`; }
       if (tb) {
         dTabs = `<div class="tabs"><button data-tab="players" class="${tab === 'players' ? 'on' : ''}">Players</button><button data-tab="loadout" class="${tab === 'loadout' ? 'on' : ''}">Loadout</button></div>`;
-        dTable = tab === 'players' ? '<table><colgroup><col style="width:38%"><col style="width:22%"><col style="width:18%"><col style="width:22%"></colgroup><tr><th>player</th><th>side/operator</th><th class="c">K/D/A</th><th class="rr">HP</th></tr>' : '<table><colgroup><col style="width:30%"><col style="width:18%"><col style="width:52%"></colgroup><tr><th>player</th><th>side/operator</th><th>loadout</th></tr>';
+        const hasHp = (tb.teams || []).some(tm => (tm.players || []).some(p => p.primaryFillBar));
+        const rs = hasHp ? { known: false, dead: new Map(), kills: new Map() } : roundState(S.log);
+        dTable = tab === 'players' ? `<table><colgroup><col style="width:36%"><col style="width:18%"><col style="width:18%"><col style="width:28%"></colgroup><tr><th>player</th><th>side/operator</th><th class="c">K/D/A</th><th class="rr">${hasHp ? 'HP' : rs.known ? 'this round' : ''}</th></tr>` : '<table><colgroup><col style="width:30%"><col style="width:18%"><col style="width:52%"></colgroup><tr><th>player</th><th>side/operator</th><th>loadout</th></tr>';
         for (const team of tb.teams || []) {
-          const side = g ? g.teams.find(x => x.id === team.id)?.infoText?.text : ''; const kda = (team.dataPoints || []).find(d => d.label === 'K/D/A')?.value || '';
-          dTable += `<tr class="team"><td colspan="${tab === 'players' ? 4 : 3}" style="color:${colorOf(team.id)}">${esc(team.name)}${sideTag(side)} <span class="dim">${esc(kda)}</span></td></tr>`;
-          for (const p of team.players || []) { const hp = p.primaryFillBar ? Math.round((p.primaryFillBar.fillFraction || 0) * 100) : null; const dead = hp === 0; const op = p.character?.label || ''; if (tab === 'players') dTable += `<tr class="${dead ? 'dead' : ''}"><td title="${esc(p.name)}">${esc(p.name)}</td><td>${esc(op)}</td><td class="c">${esc((p.dataPoints || []).find(d => d.label === 'K/D/A')?.value || '')}</td><td class="rr"><span class="hpw">${hp != null ? `<span class="hp"><i style="width:${hp}%;background:${hp > 50 ? '#3fb950' : hp > 20 ? '#d29922' : '#ff7b72'}"></i></span><span class="hpn">${hp}</span>` : ''}</span></td></tr>`; else { const items = (p.items || []).map(i => i.label).filter(Boolean); dTable += `<tr class="${dead ? 'dead' : ''}"><td title="${esc(p.name)}">${esc(p.name)}</td><td>${esc(op)}</td><td class="dim" title="${esc(items.join(', '))}">${esc(items.join(', '))}</td></tr>`; } }
+          const gt = g ? g.teams.find(x => x.id === team.id) : null; const side = gt && gt.infoText ? gt.infoText.text : ''; const kda = (team.dataPoints || []).find(d => d.label === 'K/D/A')?.value || '';
+          const players = team.players || [];
+          const hpOf = (p) => p.primaryFillBar ? Math.round((p.primaryFillBar.fillFraction || 0) * 100) : null;
+          const deadOf = (p) => { const hp = hpOf(p); return hp != null ? hp === 0 : (rs.known && isDead(rs, p)); };
+          const aliveTxt = hasHp || rs.known ? ` <span class="dim">· alive</span> ${players.filter(p => !deadOf(p)).length}/${players.length}` : '';
+          dTable += `<tr class="team"><td colspan="${tab === 'players' ? 4 : 3}" style="color:${gt ? sideColor(gt) : colorOf(team.id)}">${esc(team.name)}${sideTag(side)} <span class="dim">${esc(kda)}</span>${aliveTxt}</td></tr>`;
+          for (const p of players) {
+            const hp = hpOf(p), dead = deadOf(p); const op = p.character?.label || ''; const opSide = /terrorist/i.test(op) ? sideOf(op) : '';
+            const opCell = opSide ? `<span class="${opSide === 'CT' ? 'vct' : 'vt'}">${opSide}</span>` : esc(op);
+            if (tab === 'players') {
+              let stCell = '';
+              if (hp != null) stCell = `<span class="hpw"><span class="hp"><i style="width:${hp}%;background:${hp > 50 ? '#3fb950' : hp > 20 ? '#d29922' : '#ff7b72'}"></i></span><span class="hpn">${hp}</span></span>`;
+              else if (rs.known) { const by = dead ? (rs.dead.get(p.id) ?? rs.dead.get('n:' + String(p.name || '').toLowerCase()) ?? '') : ''; const rk = rs.kills.get(p.id) || 0; stCell = dead ? `<span class="st" title="${by ? 'killed by ' + esc(by) : 'dead'}"><span class="bad">✖</span> ${by ? esc(by) : 'dead'}</span>` : `<span class="st"><span class="ok">●</span>${rk ? ` ${rk}k` : ''}</span>`; }
+              dTable += `<tr class="${dead ? 'dead' : ''}"><td class="pn" title="${esc(p.name)}">${esc(p.name)}</td><td>${opCell}</td><td class="c">${esc((p.dataPoints || []).find(d => d.label === 'K/D/A')?.value || '')}</td><td class="rr">${stCell}</td></tr>`;
+            } else { const items = (p.items || []).map(i => i.label).filter(Boolean); dTable += `<tr class="${dead ? 'dead' : ''}"><td class="pn" title="${esc(p.name)}">${esc(p.name)}</td><td>${opCell}</td><td class="dim" title="${esc(items.join(', '))}">${esc(items.join(', '))}</td></tr>`; }
+          }
         }
         dTable += '</table>';
       }
@@ -758,5 +816,5 @@
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onReady); else onReady();
   W.__pmR6 = { state: S, export: buildExport };
-  console.log(TAG, 'v0.10.3 installed (Ctrl+Shift+R toggles)');
+  console.log(TAG, 'v0.10.4 installed (Ctrl+Shift+R toggles)');
 })();
