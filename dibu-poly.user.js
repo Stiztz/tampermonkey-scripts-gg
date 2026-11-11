@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         DibuPoly
 // @namespace    DibuVerse
-// @version      0.10.4
+// @version      0.10.6
 // @description  Polymarket scraper
 // @author       Dibujito
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=polymarket.com
 // @match        *://polymarket.com/*
 // @match        *://*.polymarket.com/*
-// @updateURL    https://github.com/Stiztz/tampermonkey-scripts-gg/raw/refs/heads/main/dibu-poly.user.js
-// @downloadURL  https://github.com/Stiztz/tampermonkey-scripts-gg/raw/refs/heads/main/dibu-poly.user.js
+// @updateURL    https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/dibu-poly.user.js
+// @downloadURL  https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/dibu-poly.user.js
 // @connect      gamma-api.polymarket.com
 // @grant        unsafeWindow
 // @run-at       document-start
@@ -521,7 +521,7 @@
       #pm-r6 .score .tn.r{text-align:right}#pm-r6 .score .tn.long{font-size:11px}#pm-r6 .score .tn.xlong{font-size:10px}
       #pm-r6 .num{font-size:26px;font-weight:bold;color:#3fb950;text-align:center;white-space:nowrap}#pm-r6 .blk-del .num{color:#ffa657}
       #pm-r6 .round{text-align:center;font-size:12px;color:#8b949e;margin:2px 0}#pm-r6 .round b{color:#c9d1d9;font-size:15px}
-      #pm-r6 .pmodds{display:grid;grid-template-columns:1fr 1fr;margin-top:4px;padding-top:4px;border-top:1px dashed #30363d}#pm-r6 .pmodds .o{text-align:center}#pm-r6 .pmodds .o b{font-size:16px}#pm-r6 .pmodds .o small{color:#8b949e}
+      #pm-r6 .pmodds{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);margin-top:4px;padding-top:4px;border-top:1px dashed #30363d}#pm-r6 .pmodds .o{text-align:center}#pm-r6 .pmodds .o b{font-size:16px}#pm-r6 .pmodds .o small{color:#8b949e}#pm-r6 .pmodds .o{min-width:0;padding:0 3px}#pm-r6 .pmodds .o small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#pm-r6 .pmst{text-align:center;font-size:12px;margin:2px 0;height:32px;overflow:hidden}#pm-r6 .pmst>div{height:16px;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       #pm-r6 .side{font-size:10px;padding:0 4px;border-radius:3px;margin:0 4px;vertical-align:middle}.side-DEF{background:#1f6feb;color:#fff}.side-ATK{background:#d29922;color:#000}#pm-r6 .side-CT{background:#4A71D4;color:#fff}#pm-r6 .side-T{background:#EEB730;color:#000}#pm-r6 .side-X{background:#30363d;color:#c9d1d9}
       #pm-r6 .dim{color:#8b949e}#pm-r6 .ok{color:#3fb950}#pm-r6 .bad{color:#ff7b72}
       #pm-r6 .ev{max-height:80px;overflow:auto;margin-top:4px;padding-top:4px;border-top:1px dashed #30363d}#pm-r6 .ev .end{color:#3fb950;font-weight:bold}.ev .map{color:#d2a8ff;font-weight:bold}.ev .info{color:#8b949e}.ev .gamma{color:#79c0ff}
@@ -699,12 +699,21 @@
       // it reads like a Raiden / kiki price; hovering it shows the raw fair odds (1 / mid).
       html += `<div class="pmodds">${headline.outcomes.map((o, i) => { const p = P[i]; const live = p.q === 'tight' || !seen; return `<div class="o"><div class="dim">${esc(o)}</div><b class="${live ? '' : 'dim'}">${live ? pct(p.mid) : '--'}</b> <span title="${live ? `fair ${dec(p.mid)} (no margin) · shown with ${Math.round(MARGIN * 100)}% margin` : 'no price'}" style="cursor:help;border-bottom:1px dotted #8b949e">→ ${live ? decM(p.mid) : '--'}</span><br><small>bid ${pct(p.ebid ?? p.bid)} · ask ${pct(p.eask ?? p.ask)}${live ? ` · fair ${dec(p.mid)}` : ''}</small></div>`; }).join('')}</div>`;
       // Say it in words too: a market that is not being priced must never read as a price.
-      if (wide) {
-        const lt = P.filter(p => p.lastT).sort((x, y) => y.lastT - x.lastT)[0];
-        html += `<div class="round"><span class="bad">WIDE SPREAD — no real price right now</span><br><span class="dim">only far-off orders are left in the book, so its middle is not a price · Polymarket's buttons show the ask: ${P.map(p => p.eask ? (1 / p.eask).toFixed(2) : '--').join(' / ')}${lt ? ` · last trade: ${esc(headline.outcomes[P.indexOf(lt)])} ${pct(lt.last)} at ${fmtT(lt.lastT)}` : ''}</span></div>`;
-      }
-      else if (seen && !tight) html += `<div class="round"><span class="bad">NO QUOTES — Polymarket is not offering a price on this market right now</span></div>`;
-      else if (!seen) html += `<div class="round"><span class="dim">last price from gamma · waiting for the order book</span></div>`;
+      // The status sits in a slot of fixed height (two lines, each cut with "…" if the panel
+      // is narrow, full text on hover) that is there in every state, priced or not. Up to
+      // 0.10.4 a priced market had no line, NO QUOTES one and WIDE SPREAD three, so a book
+      // that opens and closes every few seconds made the whole panel jump each time.
+      const lt = P.filter(p => p.lastT).sort((x, y) => y.lastT - x.lastT)[0];
+      const asks = P.some(p => p.eask) ? `page buttons (ask) ${P.map(p => p.eask ? (1 / p.eask).toFixed(2) : '--').join(' / ')}` : '';
+      const lastTxt = lt ? `last trade ${headline.outcomes[P.indexOf(lt)]} ${pct(lt.last)} ${fmtT(lt.lastT)}` : '';
+      const detail = [asks, lastTxt].filter(Boolean).join(' · ');
+      const sp = P[0] && P[0].ebid != null && P[0].eask != null ? `spread ${((P[0].eask - P[0].ebid) * 100).toFixed(1)} pts` : 'one-sided book';
+      let st, tip;
+      if (wide) { st = '<span class="bad">WIDE SPREAD — no real price right now</span>'; tip = 'Only far-off orders are left in the book, so its middle is not a price. Polymarket\'s buttons show the ask of each side.'; }
+      else if (seen && !tight) { st = '<span class="bad">NO QUOTES — Polymarket is not offering a price right now</span>'; tip = 'The order book of this market is empty (paused, or nobody is quoting).'; }
+      else if (!seen) { st = '<span class="dim">last price from gamma · waiting for the order book</span>'; tip = 'Polymarket\'s reference price; replaced as soon as the live order book arrives.'; }
+      else { st = `<span class="ok">● priced</span> <span class="dim">· ${sp}</span>`; tip = 'Bid and ask are close enough for their middle to be a price.'; }
+      html += `<div class="pmst"><div title="${esc(tip)}">${st}</div><div class="dim" title="${esc(detail)}">${detail ? esc(detail) : '&nbsp;'}</div></div>`;
     }
     else html += `<div class="dim" style="margin-top:4px">market: loading…</div>`;
     html += `<div class="ev">${S.liveChanges.slice().reverse().map(e => `<div><span class="dim">${fmtT(e.t)}</span> <span class="${e.cls || ''}">${esc(e.text)}</span></div>`).join('')}</div>`;
@@ -816,5 +825,5 @@
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onReady); else onReady();
   W.__pmR6 = { state: S, export: buildExport };
-  console.log(TAG, 'v0.10.4 installed (Ctrl+Shift+R toggles)');
+  console.log(TAG, 'v0.10.6 installed (Ctrl+Shift+R toggles)');
 })();
