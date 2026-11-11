@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DibuPoly
 // @namespace    DibuVerse
-// @version      0.10.8
+// @version      0.10.9
 // @description  Polymarket scraper
 // @author       Dibujito
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=polymarket.com
@@ -699,16 +699,41 @@
   const sideTag = (txt) => { const sd = sideOf(txt); return sd ? `<span class="side side-${/^(CT|T|DEF|ATK)$/.test(sd) ? sd : 'X'}">${esc(sd)}</span>` : ''; };
   const colorOf = (id) => (S.colors[id] && S.colors[id].sideColor) || '#c9d1d9';
   const nameCls = (n) => (n || '').length > 20 ? 'xlong' : (n || '').length > 13 ? 'long' : '';
+  // Polymarket lists a market's two outcomes in its own order ("Weibo Gaming", "DarkZero
+  // Esports"), which need not be the order series-state gives the teams ("DarkZero", "Weibo
+  // Gaming" - match of 11 Nov: DarkZero's score sat above Weibo's price). The two are paired
+  // by name: generic words and accents dropped, then exact > contained > shared word or
+  // initials > same first letters. Reversed only when the crossed pairing scores higher.
+  const nameKey = (n) => String(n || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\b(e-?sports?|gaming|team|clan|club)\b/g, ' ').replace(/[^a-z0-9]+/g, ' ').trim();
+  function nameSim(a, b) {
+    const x = nameKey(a), y = nameKey(b); if (!x || !y) return 0;
+    const xc = x.replace(/ /g, ''), yc = y.replace(/ /g, ''); if (xc === yc) return 4;
+    if (xc.includes(yc) || yc.includes(xc)) return 3;
+    const xt = x.split(' '), yt = y.split(' '), ini = (t) => t.map(w => w[0]).join('');
+    if (xt.some(w => w.length > 1 && yt.includes(w)) || (xt.length > 1 && ini(xt) === yc) || (yt.length > 1 && ini(yt) === xc)) return 2;
+    return xc.slice(0, 3) === yc.slice(0, 3) ? 1 : 0;
+  }
+  function outcomesReversed(outcomes, teams) {
+    if (!outcomes || !teams || outcomes.length !== 2 || teams.length !== 2) return false;
+    return nameSim(outcomes[0], teams[1]) + nameSim(outcomes[1], teams[0]) > nameSim(outcomes[0], teams[0]) + nameSim(outcomes[1], teams[1]);
+  }
   const shortName = (n) => (n || '').replace(/\s+(Alienware|Esports|E-?sports|Gaming|Team)$/i, '').slice(0, 14);
 
   let paintAllKeys = [];
   function paint() {
     if (!hud || !visibleHud) return;
     const L = S.live; const game = L ? (currentGame(L) || { teams: L.teams, sequenceNumber: '-' }) : null;
-    // Team order on screen: as the feeds give it, or mirrored by the ⇄ button. ord() mirrors a
-    // pair, flipSc() mirrors every "a-b" score inside a text (gamma's record, the event feed).
+    // Team order on screen: series-state's (the score row), or mirrored by the ⇄ button.
+    // Everything else follows that order: ord() mirrors a pair, flipIf() mirrors every "a-b"
+    // score inside a text. What comes from Polymarket (a market's outcomes and prices, gamma's
+    // score record) is first put in the score row's order when its own is the other way round
+    // (pmRev), then mirrored like the rest - hence the "!==" (one or the other, not both).
     const sw = swapped(); const ord = (arr) => sw ? arr.slice().reverse() : arr;
-    const flipSc = (txt) => sw ? String(txt ?? '').replace(/\b(\d+)-(\d+)\b/g, '$2-$1') : txt;
+    const flipIf = (on, txt) => on ? String(txt ?? '').replace(/\b(\d+)-(\d+)\b/g, '$2-$1') : txt;
+    const flipSc = (txt) => flipIf(sw, txt);
+    const pmRev = (m) => !!(m && game && game.teams && outcomesReversed(m.outcomes, game.teams.map(t => t.name)));
+    const ordPm = (m, arr) => pmRev(m) !== sw ? arr.slice().reverse() : arr;
+    const gammaFlip = pmRev(S.market || S.pmMarkets.find(m => m.norm.key === 'match_winner') || S.pmMarkets[0]) !== sw;
     const gT = game ? ord(game.teams) : null;
     hud.querySelector('#pm-swap').classList.toggle('on', sw);
     hud.querySelector('#pm-sum').textContent = (!game && S.gamma && S.market) ? `${ord(S.market.outcomes).map(shortName).join(' vs ')} · gamma ${flipSc(S.gamma.score).split('|')[0] || '—'} · ${S.gamma.live ? 'live' : 'not live'}` : game ? `${shortName(gT[0].name)} ${gT[0].score}:${gT[1].score} ${shortName(gT[1].name)} · R${game.finished ? '—' : gT[0].score + gT[1].score + 1} · map ${game.sequenceNumber} · series ${ord(L.teams).map(x => x.score).join(':')}${L.started ? '' : ' · not started'}` : `series ${S.seriesId || '?'}`;
@@ -717,7 +742,7 @@
     let html = '';
     if (!L && !S.gamma) html += '<div class="dim">waiting for series-state / gamma…</div>';
     if (L) { const [a, b] = gT; const roundNo = game.finished ? '—' : (a.score + b.score + 1); html += `<div class="score"><span class="tn r ${nameCls(a.name)}" style="color:${colorOf(a.id)}">${esc(a.name)}</span><span class="num">${a.score} : ${b.score}</span><span class="tn ${nameCls(b.name)}" style="color:${colorOf(b.id)}">${esc(b.name)}</span></div><div class="round"><b>ROUND ${roundNo}</b> · map ${game.sequenceNumber}${game.finished ? ' finished' : ''} · ${esc(L.format)} · series ${ord(L.teams).map(x => x.score).join(':')}${L.finished ? ' · SERIES FINISHED' : L.started ? '' : ' · NOT STARTED'}</div>`; }
-    if (S.gamma) { const sc = String(flipSc(S.gamma.score)).split('|'); html += `<div class="round" style="margin-top:${L ? 0 : 6}px"><span class="dim">Polymarket (gamma):</span> <b>${esc(sc[0] || '—')}</b>${sc[1] ? ` <span class="dim">series</span> <b>${esc(sc[1])}</b>` : ''}${sc[2] ? ` <span class="dim">${esc(sc[2])}</span>` : ''} · ${S.gamma.ended ? 'ended' : S.gamma.live ? '<span class="ok">live</span>' : '<span class="dim">not live</span>'}${S.gamma.period ? ` · period ${esc(S.gamma.period)}` : ''}${S.gamma.gridSeriesId ? '' : ' · <span class="bad">no GRID feed</span>'} <span class="dim">· ${fmtT(S.gammaT)}</span></div>`; }
+    if (S.gamma) { const sc = String(flipIf(gammaFlip, S.gamma.score)).split('|'); html += `<div class="round" style="margin-top:${L ? 0 : 6}px"><span class="dim">Polymarket (gamma):</span> <b>${esc(sc[0] || '—')}</b>${sc[1] ? ` <span class="dim">series</span> <b>${esc(sc[1])}</b>` : ''}${sc[2] ? ` <span class="dim">${esc(sc[2])}</span>` : ''} · ${S.gamma.ended ? 'ended' : S.gamma.live ? '<span class="ok">live</span>' : '<span class="dim">not live</span>'}${S.gamma.period ? ` · period ${esc(S.gamma.period)}` : ''}${S.gamma.gridSeriesId ? '' : ' · <span class="bad">no GRID feed</span>'} <span class="dim">· ${fmtT(S.gammaT)}</span></div>`; }
     // A map already played (finished in series-state, or a side priced at 99%+) has nothing
     // left to show: its market goes away.
     const mapDone = (m) => { const n = (/^map(\d)_winner$/.exec(m.norm.key) || [])[1]; if (!n) return false; const gm = L && (L.games || []).find(x => x.sequenceNumber === +n); if (gm && gm.finished) return true; return (m.prices || []).some(p => p && p.mid != null && (p.mid >= 0.99 || p.mid <= 0.01)); };
@@ -733,14 +758,14 @@
       const seen = P.some(p => p.bookSeen), tight = P.some(p => p.q === 'tight'), wide = !tight && P.some(p => p.q === 'wide');
       // The decimal carries a bookmaker's margin (MARGIN, split evenly over the two sides), so
       // it reads like a Raiden / kiki price; hovering it shows the raw fair odds (1 / mid).
-      html += `<div class="pmodds">${ord(headline.outcomes.map((o, i) => { const p = P[i]; const live = p.q === 'tight' || !seen; return `<div class="o"><div class="dim">${esc(o)}</div><b class="${live ? '' : 'dim'}">${live ? pct(p.mid) : '--'}</b> <span title="${live ? `fair ${dec(p.mid)} (no margin) · shown with ${Math.round(MARGIN * 100)}% margin` : 'no price'}" style="cursor:help;border-bottom:1px dotted #8b949e">→ ${live ? decM(p.mid) : '--'}</span><br><small>bid ${pct(p.ebid ?? p.bid)} · ask ${pct(p.eask ?? p.ask)}${live ? ` · fair ${dec(p.mid)}` : ''}</small></div>`; })).join('')}</div>`;
+      html += `<div class="pmodds">${ordPm(headline, headline.outcomes.map((o, i) => { const p = P[i]; const live = p.q === 'tight' || !seen; return `<div class="o"><div class="dim">${esc(o)}</div><b class="${live ? '' : 'dim'}">${live ? pct(p.mid) : '--'}</b> <span title="${live ? `fair ${dec(p.mid)} (no margin) · shown with ${Math.round(MARGIN * 100)}% margin` : 'no price'}" style="cursor:help;border-bottom:1px dotted #8b949e">→ ${live ? decM(p.mid) : '--'}</span><br><small>bid ${pct(p.ebid ?? p.bid)} · ask ${pct(p.eask ?? p.ask)}${live ? ` · fair ${dec(p.mid)}` : ''}</small></div>`; })).join('')}</div>`;
       // Say it in words too: a market that is not being priced must never read as a price.
       // The status sits in a slot of fixed height (two lines, each cut with "…" if the panel
       // is narrow, full text on hover) that is there in every state, priced or not. Up to
       // 0.10.4 a priced market had no line, NO QUOTES one and WIDE SPREAD three, so a book
       // that opens and closes every few seconds made the whole panel jump each time.
       const lt = P.filter(p => p.lastT).sort((x, y) => y.lastT - x.lastT)[0];
-      const asks = P.some(p => p.eask) ? `page buttons (ask) ${ord(P.map(p => p.eask ? (1 / p.eask).toFixed(2) : '--')).join(' / ')}` : '';
+      const asks = P.some(p => p.eask) ? `page buttons (ask) ${ordPm(headline, P.map(p => p.eask ? (1 / p.eask).toFixed(2) : '--')).join(' / ')}` : '';
       const lastTxt = lt ? `last trade ${headline.outcomes[P.indexOf(lt)]} ${pct(lt.last)} ${fmtT(lt.lastT)}` : '';
       const detail = [asks, lastTxt].filter(Boolean).join(' · ');
       const sp = P[0] && P[0].ebid != null && P[0].eask != null ? `spread ${((P[0].eask - P[0].ebid) * 100).toFixed(1)} pts` : 'one-sided book';
@@ -752,7 +777,7 @@
       html += `<div class="pmst"><div title="${esc(tip)}">${st}</div><div class="dim" title="${esc(detail)}">${detail ? esc(detail) : '&nbsp;'}</div></div>`;
     }
     else html += `<div class="dim" style="margin-top:4px">market: loading…</div>`;
-    html += `<div class="ev">${S.liveChanges.slice().reverse().map(e => `<div><span class="dim">${fmtT(e.t)}</span> <span class="${e.cls || ''}">${esc(flipSc(e.text))}</span></div>`).join('')}</div>`;
+    html += `<div class="ev">${S.liveChanges.slice().reverse().map(e => `<div><span class="dim">${fmtT(e.t)}</span> <span class="${e.cls || ''}">${esc(flipIf(/^GAMMA score/.test(e.text) ? gammaFlip : sw, e.text))}</span></div>`).join('')}</div>`;
     setHTML(hud.querySelector('#pm-live'), html);
 
     // ---- veto
@@ -802,13 +827,18 @@
       // CSS animation, hence the negative delay that keeps the blink in phase with the clock.
       const rsAll = roundState(S.log);
       if (rsAll.bomb) clockTxt = `<span class="bomb" style="animation-delay:-${now() % 1000}ms" title="${esc(rsAll.bomb.by ? 'bomb planted by ' + rsAll.bomb.by : 'bomb planted')}">💣 ${S.clock ? clockTxt.replace('⏱ ', '') : 'BOMB'}</span>`;
-      if (g) { const [a, b] = ord(g.teams); const nm = (id) => (S.teamsBoard?.teams || sb.series?.teams || []).find(x => x.id === id)?.name || id; dHead = `<div class="score"><span class="tn r ${nameCls(nm(a.id))}" style="color:${sideColor(a)}">${esc(nm(a.id))}${sideTag(a.infoText?.text)}</span><span class="num">${a.score} : ${b.score}</span><span class="tn ${nameCls(nm(b.id))}" style="color:${sideColor(b)}">${sideTag(b.infoText?.text)}${esc(nm(b.id))}</span></div><div class="round"><b>ROUND ${S.delayedRound ?? (a.score + b.score + 1)}</b> · ${esc(g.centeredInfoText || g.mapName || '')} · <b>${clockTxt}</b> · ${esc(g.status || '')}</div>`; }
+      // The delayed blocks keep each team on the side it has in the real-time row: GRID's
+      // scoreboard order is turned round when its two team ids are the real-time ones crossed.
+      const rtIds = game && game.teams && game.teams.length === 2 ? game.teams.map(t => String(t.id)) : null;
+      const crossed = (arr) => !!(rtIds && arr && arr.length === 2 && String(arr[0].id) === rtIds[1] && String(arr[1].id) === rtIds[0]);
+      const ordD = (arr) => crossed(arr) !== sw ? arr.slice().reverse() : arr;
+      if (g) { const [a, b] = ordD(g.teams); const nm = (id) => (S.teamsBoard?.teams || sb.series?.teams || []).find(x => x.id === id)?.name || id; dHead = `<div class="score"><span class="tn r ${nameCls(nm(a.id))}" style="color:${sideColor(a)}">${esc(nm(a.id))}${sideTag(a.infoText?.text)}</span><span class="num">${a.score} : ${b.score}</span><span class="tn ${nameCls(nm(b.id))}" style="color:${sideColor(b)}">${sideTag(b.infoText?.text)}${esc(nm(b.id))}</span></div><div class="round"><b>ROUND ${S.delayedRound ?? (a.score + b.score + 1)}</b> · ${esc(g.centeredInfoText || g.mapName || '')} · <b>${clockTxt}</b> · ${esc(g.status || '')}</div>`; }
       if (tb) {
         dTabs = `<div class="tabs"><button data-tab="players" class="${tab === 'players' ? 'on' : ''}">Players</button><button data-tab="loadout" class="${tab === 'loadout' ? 'on' : ''}">Loadout</button></div>`;
         const hasHp = (tb.teams || []).some(tm => (tm.players || []).some(p => p.primaryFillBar));
         const rs = hasHp ? { known: false, dead: new Map(), kills: new Map() } : rsAll;
         dTable = tab === 'players' ? `<table><colgroup><col style="width:36%"><col style="width:18%"><col style="width:18%"><col style="width:28%"></colgroup><tr><th>player</th><th>side/operator</th><th class="c">K/D/A</th><th class="rr">${hasHp ? 'HP' : rs.known ? 'this round' : ''}</th></tr>` : '<table><colgroup><col style="width:30%"><col style="width:18%"><col style="width:52%"></colgroup><tr><th>player</th><th>side/operator</th><th>loadout</th></tr>';
-        for (const team of ord(tb.teams || [])) {
+        for (const team of ordD(tb.teams || [])) {
           const gt = g ? g.teams.find(x => x.id === team.id) : null; const side = gt && gt.infoText ? gt.infoText.text : ''; const kda = (team.dataPoints || []).find(d => d.label === 'K/D/A')?.value || '';
           const players = team.players || [];
           const hpOf = (p) => p.primaryFillBar ? Math.round((p.primaryFillBar.fillFraction || 0) * 100) : null;
@@ -866,5 +896,5 @@
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onReady); else onReady();
   W.__pmR6 = { state: S, export: buildExport };
-  console.log(TAG, 'v0.10.8 installed (Ctrl+Shift+R toggles)');
+  console.log(TAG, 'v0.10.9 installed (Ctrl+Shift+R toggles)');
 })();
