@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DibuPoly
 // @namespace    DibuVerse
-// @version      0.10.9
+// @version      0.11.0
 // @description  Polymarket scraper
 // @author       Dibujito
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=polymarket.com
@@ -11,13 +11,39 @@
 // @downloadURL  https://raw.githubusercontent.com/Stiztz/tampermonkey-scripts-gg/main/dibu-poly.user.js
 // @connect      gamma-api.polymarket.com
 // @grant        unsafeWindow
+// @grant        GM_getResourceURL
+// @resource     map_cs2_ancient    https://liquipedia.net/commons/images/thumb/f/fc/CS2_de_ancient.png/534px-CS2_de_ancient.png
+// @resource     map_cs2_anubis     https://liquipedia.net/commons/images/thumb/2/28/CS2_de_anubis.png/534px-CS2_de_anubis.png
+// @resource     map_cs2_cache      https://liquipedia.net/commons/images/thumb/b/b6/CS2_de_cache.png/534px-CS2_de_cache.png
+// @resource     map_cs2_dust2      https://liquipedia.net/commons/images/thumb/d/d7/CS2_Dust_2_A_Site.jpg/534px-CS2_Dust_2_A_Site.jpg
+// @resource     map_cs2_inferno    https://liquipedia.net/commons/images/thumb/0/08/CS2_de_inferno.png/534px-CS2_de_inferno.png
+// @resource     map_cs2_mirage     https://liquipedia.net/commons/images/thumb/f/f1/CS2_de_mirage.png/534px-CS2_de_mirage.png
+// @resource     map_cs2_nuke       https://liquipedia.net/commons/images/thumb/a/ad/CS2_de_nuke.png/534px-CS2_de_nuke.png
+// @resource     map_r6_border      https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/4hqsrL3cokFqedkfjiEaGf/655acbe5ae4ffab54f742d17f929d2af/R6S_Maps_Border_EXT.jpg
+// @resource     map_r6_chalet      https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/Km3ZJUM7ZMVbGsi6gad5Y/5656a6da468b39f5e8effe5307592f28/R6S_Maps_Chalet_EXT.jpg
+// @resource     map_r6_clubhouse   https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/1vCw5eD2XzxZlv6Au1gtui/06a84bacaacab62937dd6d4d8ae393c7/R6S_Maps_ClubHouse_EXT.jpg
+// @resource     map_r6_bank        https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/6ilgtuzucX7hEu2MvjhRtp/c7c7e63cff53c8b2192fdec68a736619/R6S_Maps_Bank_EXT.jpg
+// @resource     map_r6_kafe        https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/2nIuPSHvbM57TK90VSwBEm/c9b6b012d961c03a930902fb14e36ea1/R6S_Maps_RussianCafe_EXT.jpg
+// @resource     map_r6_lair        https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/423IqxUqD6yfPEy6CissY0/8fadc01d9fe5ec8695b80be8be9850a7/ModernizedMap_Lair_keyart.jpg
+// @resource     map_r6_nighthaven  https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/57i2PyuzpgVFzOvLUSAItO/97a571fdb6f568ae69951b75f572d361/ModernizedMap_Nighthaven_keyart.jpg
+// @resource     map_r6_fortress    https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/1MrLwvq61aSSvvUj3dDiZg/58bd501d0064d7b453396bb5a2bd56be/fortress-reworked-thumbnail.jpg
+// @resource     map_r6_villa       https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/Io6dxNeHbCbJoF9WLJf9s/0b9ed52de358585c47c327c46907d1cd/r6s-maps-villa-thumb.jpg
+// @resource     op_noor            https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/6DHgKOCoB9bcrQJiOjvQad/8b60ed79e3ce1dd3a352a0d1018cc604/r6s-operators-badge-noor.png
+// @resource     op_solidsnake      https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/7l8uzV1767cot7GpTcnK7t/9be16729f34b76e97dbcbbd0a81bd74c/r6s-operators-badge-solidsnake.png
+// @resource     op_denari          https://staticctf.ubisoft.com/J3yJr34U2pZ2Ieem48Dwy9uqj5PNUQTn/17XNHqqrkLQ7lYFqciEwmP/21d50fb6c296d26a47f8dd84dd19298b/r6s-operators-badge-denari.png
 // @run-at       document-start
 // ==/UserScript==
 
 /*
   Runs on polymarket.com esports event pages only. It reads what the page itself loads
   (series-state, gamma, the GRID widget sockets, the CLOB order book) and shows it as a HUD:
-  real-time score and Polymarket odds, the delayed GRID widgets, and the map veto.
+  real-time score and Polymarket odds, the delayed GRID widgets, the map veto and the
+  match's stream.
+
+  Pictures (map backgrounds, operators GRID has no picture for) are @resource lines:
+  Tampermonkey downloads them once, at install or update, and hands them over as a local
+  address. Polymarket's page only shows pictures from its own hosts, from GRID, or local
+  ones, so a picture straight from another site would be blocked.
 */
 
 (function () {
@@ -57,6 +83,81 @@
   const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const mmss = (s) => { s = Math.max(0, Math.round(s)); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); };
   const NativeWS = W.WebSocket, nativeFetch = W.fetch.bind(W);
+
+  // ================================================================ pictures, maps, operators, stream
+  // A @resource as a local address ('' when Tampermonkey could not download it).
+  const resCache = {};
+  const resUrl = (name) => { if (name in resCache) return resCache[name]; let u = ''; try { u = typeof GM_getResourceURL === 'function' ? GM_getResourceURL(name) || '' : ''; } catch (e) { u = ''; } return (resCache[name] = u); };
+  // One key per map however it is written: "de_mirage", "Mirage", "Chalet_V2_MOD" and
+  // "Chalet V2 MOD" give "mirage" and "chalet".
+  const mapKey = (n) => String(n || '').toLowerCase().replace(/[_\s-]+/g, ' ').replace(/^(de|cs) /, '').replace(/\b(v\d+|mod)\b/g, '').replace(/[^a-z0-9]+/g, '');
+  // GRID writes some maps under the game's internal name: "Russiancafe" is Kafe Dostoyevsky,
+  // "Italy" is Villa, "Morocco" is Fortress, "Viperstrike" is Lair (veto of FaZe-LOS, 9 Nov).
+  const MAP_ALIASES = { kafedostoyevsky: 'russiancafe', kafe: 'russiancafe', villa: 'italy', fortress: 'morocco', lair: 'viperstrike', dust2: 'dustii' };
+  // How well a picture fits a map: 2 the same map (same key, or a known other name), 1 one
+  // name starts with the other ("nighthaven" / "nighthavenlabs"), 0 not this map.
+  function mapFit(pic, map) {
+    const f = mapKey(pic), k = mapKey(map);
+    if (!f || !k) return 0;
+    if (f === k || MAP_ALIASES[f] === k || MAP_ALIASES[k] === f) return 2;
+    return Math.min(f.length, k.length) >= 5 && (f.startsWith(k) || k.startsWith(f)) ? 1 : 0;
+  }
+  // The map pictures this script carries (@resource map_<game>_<map>), by game. Only the
+  // maps of the competitive pools.
+  const MAP_PICS = {
+    cs2: ['ancient', 'anubis', 'cache', 'dust2', 'inferno', 'mirage', 'nuke'],
+    r6: ['bank', 'border', 'chalet', 'clubhouse', 'fortress', 'kafe', 'lair', 'nighthaven', 'villa'],
+  };
+  // The game an event is for, from the first word of its slug ("cs2-pcy-tt3-…", "r6siege-…").
+  const GAME_ALIASES = { r6siege: 'r6', r6: 'r6', cs2: 'cs2', csgo: 'cs2', val: 'valorant', valorant: 'valorant', lol: 'lol', dota2: 'dota2', dota: 'dota2' };
+  const gameOfSlug = (slug) => { const w = String(slug || '').toLowerCase().split('-')[0]; return GAME_ALIASES[w] || w || ''; };
+
+  // Operators (R6). GRID's catalogue lags behind the game: a new operator can come with no
+  // name at all ("default-0x679c49b955") or with a name but no picture (its icon address
+  // answers {"error":"Invalid resize path"}), and it may name one by an internal code
+  // ("DIAMOND" is Solid Snake) - DarkZero vs Team Liquid and VP vs M80, 12 Nov. The id at the
+  // end of the icon address is always there, so the table goes by that id.
+  const OPERATORS = {
+    '0x679c49b955': { name: 'Noor', res: 'op_noor' },
+    '0x64d62db918': { name: 'Solid Snake', res: 'op_solidsnake' },
+    '0x62bfaa45d7': { name: 'Denari', res: 'op_denari' },
+  };
+  const OP_ID = /\b(0x[0-9a-f]{6,})\b/i;
+  function operatorOf(character) {
+    if (!character) return null;
+    const label = String(character.label || '').trim();
+    const iconUrl = /^https:\/\/cdn\.grid\.gg\//.test(character.iconUrl || '') ? character.iconUrl : '';
+    const m = OP_ID.exec(iconUrl.split('/').pop() || '') || OP_ID.exec(label);
+    const id = m ? m[1].toLowerCase() : null;
+    const row = id ? OPERATORS[id] : null;
+    const unnamed = !label || /^default-0x/i.test(label);
+    const name = row ? row.name : unnamed ? (id ? `Unknown operator (${id.slice(0, 6)}…)` : 'Unknown operator') : label;
+    const initials = !row && unnamed ? '?' : name.split(/\s+/).filter(Boolean).map(w => w[0]).join('').slice(0, 2).toUpperCase() || '?';
+    return { id, name, label, iconUrl, fallback: row ? resUrl(row.res) : '', initials, known: !!row || !unnamed };
+  }
+
+  // The match's stream: the event names its broadcast in resolutionSource. It is a stream
+  // only on these hosts (Polymarket's page lets their players in); hltv, vlr or liquipedia
+  // are where the result is checked, not something to watch.
+  function streamOf(url) {
+    let u; try { u = new URL(String(url || '')); } catch (e) { return null; }
+    if (u.protocol !== 'https:') return null;
+    const host = u.hostname.replace(/^(www|m)\./, ''); const parts = u.pathname.split('/').filter(Boolean);
+    if (host === 'twitch.tv' && parts[0] && /^[a-z0-9_]{2,25}$/i.test(parts[0]) && !['videos', 'directory', 'p', 'search'].includes(parts[0].toLowerCase())) {
+      const channel = parts[0].toLowerCase();
+      return { kind: 'twitch', label: 'Twitch', channel, url: `https://www.twitch.tv/${channel}`, player: (parent) => `https://player.twitch.tv/?channel=${encodeURIComponent(channel)}&parent=${encodeURIComponent(parent)}&autoplay=true&muted=true` };
+    }
+    if (host === 'kick.com' && parts[0] && /^[a-z0-9_-]{2,40}$/i.test(parts[0])) {
+      const channel = parts[0].toLowerCase();
+      return { kind: 'kick', label: 'Kick', channel, url: `https://kick.com/${channel}`, player: () => `https://player.kick.com/${encodeURIComponent(channel)}?autoplay=true&muted=true` };
+    }
+    let vid = null;
+    if (host === 'youtube.com' && parts[0] === 'watch') vid = u.searchParams.get('v');
+    else if (host === 'youtube.com' && (parts[0] === 'live' || parts[0] === 'embed') && parts[1]) vid = parts[1];
+    else if (host === 'youtu.be' && parts[0]) vid = parts[0];
+    if (vid && /^[A-Za-z0-9_-]{6,20}$/.test(vid)) return { kind: 'youtube', label: 'YouTube', channel: vid, url: `https://www.youtube.com/watch?v=${vid}`, player: () => `https://www.youtube.com/embed/${vid}?autoplay=1&mute=1` };
+    return null;
+  }
 
   // ================================================================ shared: market normalisation
   // Returns {key,label} so the same market from different books lands in the same table.
@@ -123,7 +224,7 @@
   const S = {
     seriesId: null, slug: null, live: null, liveT: 0, liveChanges: [],
     scoreboard: null, teamsBoard: null, colors: {}, log: [], clock: null, delayedRound: null,
-    frames: [], states: [], declaredDelay: null, delaySamples: [],
+    frames: [], states: [], declaredDelay: null, boardDelay: null, delaySamples: [],
     gridOwn: null, gridStatus: 'idle', gridLastMsg: 0, gridFirstMsg: 0, gridRetryT: 0, veto: [], sockState: {}, pageLogSeen: 0,
     market: null, pmMarkets: [], clobWs: null, gamma: null, gammaT: 0, gammaLog: [], headlineKey: null,   // null: follow the map being played
     sounds: { live: true }, polling: true, pollTimer: null,
@@ -218,7 +319,7 @@
   // gamma event record: Polymarket's own score/live/period fields (updated server-side even when no widgets exist)
   function onGamma(ev) {
     if (!ev) return; const t = now(); const prev = S.gamma;
-    const g = { score: ev.score || '', live: !!ev.live, ended: !!ev.ended, period: ev.period || '', gridSeriesId: ev.eventMetadata?.gridSeriesId || null, pandascoreMatchId: ev.eventMetadata?.pandascoreMatchId || null, league: ev.eventMetadata?.league || '', updatedAt: ev.updatedAt };
+    const g = { score: ev.score || '', live: !!ev.live, ended: !!ev.ended, period: ev.period || '', source: typeof ev.resolutionSource === 'string' ? ev.resolutionSource : '', gridSeriesId: ev.eventMetadata?.gridSeriesId || null, pandascoreMatchId: ev.eventMetadata?.pandascoreMatchId || null, league: ev.eventMetadata?.league || '', updatedAt: ev.updatedAt };
     S.gamma = g; S.gammaT = t;
     if (prev && (prev.score !== g.score || prev.live !== g.live || prev.ended !== g.ended || prev.period !== g.period)) { S.gammaLog.push({ t, ...g }); if (S.gammaLog.length > 300) S.gammaLog.shift(); pushLive(`GAMMA score ${g.score || '—'} · period ${g.period || '—'} · ${g.ended ? 'ended' : g.live ? 'live' : 'not live'}`, 'gamma'); if (!S.seriesId && prev.score !== g.score && S.sounds.live) SFX.roundEnd(); }
     if (!prev) S.gammaLog.push({ t, ...g });
@@ -309,7 +410,15 @@
     // 0.6.0 matched the bare names only, so the live log and scoreboards stayed empty.
     msg.service = String(msg.service).replace(/^integrity_safe_/, '');
     if (msg.scope && msg.scope.id) { const sid = String(msg.scope.id); if (!acceptSeries(sid)) return; setSeries(sid); }
-    if (typeof msg.delay === 'number' && msg.service !== 'team_colors') S.declaredDelay = msg.delay; // team colours declare 180s; not the data delay
+    // Each service declares its own delay, and they differ (CCT South America, 12 Nov: the
+    // series scoreboard - score, sides, round clock - declares 0 and its score moved a second
+    // BEFORE Polymarket's own real-time score; players and live log declare 8 and arrived a
+    // median 8.8 s after the event; team colours declare 135). Kept apart: one number for
+    // the score row, one for the players and the log.
+    if (typeof msg.delay === 'number') {
+      if (msg.service === 'series_scoreboard_v2') S.boardDelay = msg.delay;
+      else if (msg.service === 'team_scoreboard' || msg.service === 'live_log') S.declaredDelay = msg.delay;
+    }
     for (const item of msg.data || []) { let data = item; try { if (item && item.isCompressed && item.data) data = await gunzipB64(item.data); else if (item && typeof item.data === 'string') { try { data = JSON.parse(item.data); } catch { data = item; } } } catch { continue; } recordFrame(msg.service, msg.delay, data); try { handleService(msg.service, data); } catch (e) { console.warn(TAG, e); } }
     render();
   }
@@ -421,10 +530,19 @@
     return t.toUpperCase().slice(0, 4);
   }
 
+  // An operator GRID could not name, and the table does not have either: one console line
+  // per id, so it can be added to OPERATORS.
+  const opsReported = new Set();
+  function reportOperators(d) {
+    for (const tm of d.teams || []) for (const p of tm.players || []) {
+      const op = operatorOf(p.character); if (!op || op.known || !op.id || opsReported.has(op.id)) continue;
+      opsReported.add(op.id); console.warn(TAG, `operator not in the table: ${op.id} (GRID calls it "${op.label}", played by ${p.name || 'a player'})`);
+    }
+  }
   function handleService(service, d) {
     const t = now();
-    if (service === 'series_scoreboard_v2') { S.scoreboard = { ...d, t }; const g = (d.games || [])[d.activeGameIndex || 0]; if (g && g.gameClock) { S.clock = { seconds: g.gameClock.currentSeconds, ticking: !!g.gameClock.isTicking, backwards: !!g.gameClock.tickingBackwards, recvT: t }; if (g.gameClock.occurredAt) addDelaySample(g.gameClock.occurredAt); } if (g && Array.isArray(g.momentum)) { const act = g.momentum.find(m => m.active && /^\d+$/.test(m.contentText || '')); if (act) S.delayedRound = +act.contentText; } }
-    else if (service === 'team_scoreboard') S.teamsBoard = { ...d, t };
+    if (service === 'series_scoreboard_v2') { S.scoreboard = { ...d, t }; const g = (d.games || [])[d.activeGameIndex || 0]; if (g && g.gameClock) { S.clock = { seconds: g.gameClock.currentSeconds, ticking: !!g.gameClock.isTicking, backwards: !!g.gameClock.tickingBackwards, recvT: t }; } if (g && Array.isArray(g.momentum)) { const act = g.momentum.find(m => m.active && /^\d+$/.test(m.contentText || '')); if (act) S.delayedRound = +act.contentText; } }
+    else if (service === 'team_scoreboard') { S.teamsBoard = { ...d, t }; reportOperators(d); }
     else if (service === 'team_colors') { for (const tm of d.teams || []) S.colors[tm.id] = tm; }
     else if (service === 'live_log') {
       const entries = d.type === 'addEntry' && d.body?.entryToAdd ? [d.body.entryToAdd] : (d.entries || d.body?.entries || []); const fresh = d.type === 'addEntry';
@@ -545,7 +663,7 @@
       #pm-r6 .blk-live .bt{background:#2ea043;color:#fff}#pm-r6 .blk-del .bt{background:#d29922;color:#000}#pm-r6 .blk-veto .bt{background:#a371f7;color:#fff}#pm-r6 .veto-sid{margin-bottom:4px}#pm-r6 .veto-sid b{color:#d2a8ff;font-size:13px;letter-spacing:.5px}#pm-r6 .veto-steps div{padding:1px 0}#pm-r6 .va{font-weight:bold}#pm-r6 .va-ban{color:#f85149}#pm-r6 .va-pick{color:#3fb950}#pm-r6 .va-decider{color:#d29922}#pm-r6 .va-side{color:#a371f7}#pm-r6 .vct{color:#58a6ff;font-weight:bold}#pm-r6 .vt{color:#e3b341;font-weight:bold}#pm-r6 table.veto-maps{width:100%;margin-top:6px;border-collapse:collapse}#pm-r6 table.veto-maps th,#pm-r6 table.veto-maps td{text-align:left;padding:2px 4px;border-bottom:1px solid #30363d}
       #pm-r6 .bb{padding:6px 8px}
       #pm-r6 .score{display:grid;grid-template-columns:1fr 110px 1fr;align-items:center;gap:6px}
-      #pm-r6 .score .tn{font-weight:bold;white-space:normal;word-break:break-word;line-height:1.15;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+      #pm-r6 .score .tn{font-weight:bold;white-space:normal;overflow-wrap:anywhere;text-wrap:balance;line-height:1.15;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
       #pm-r6 .score .tn.r{text-align:right}#pm-r6 .score .tn.long{font-size:11px}#pm-r6 .score .tn.xlong{font-size:10px}
       #pm-r6 .num{font-size:26px;font-weight:bold;color:#3fb950;text-align:center;white-space:nowrap}#pm-r6 .blk-del .num{color:#ffa657}
       #pm-r6 .round{text-align:center;font-size:12px;color:#8b949e;margin:2px 0}#pm-r6 .round b{color:#c9d1d9;font-size:15px}
@@ -560,30 +678,149 @@
       #pm-r6 .fold{display:flex;justify-content:space-between;align-items:center;margin-top:6px;padding:3px 6px;background:#ffffff0a;border-radius:4px;cursor:pointer;user-select:none}
       #pm-r6 .log{max-height:160px;overflow:auto;margin-top:4px}#pm-r6 .log .Kills{color:#ff7b72}.log .General{color:#3fb950;font-weight:bold}.log .Other{color:#8b949e}.log .Objectives{color:#ffa657}
       #pm-r6 .cap{display:flex;justify-content:space-between;color:#8b949e}
+      /* ---------- DELAYED section (redesign) ---------- */
+      #pm-del{position:relative;overflow:hidden;container-type:inline-size;font-family:ui-sans-serif,"Inter","Segoe UI",system-ui,sans-serif;font-variant-numeric:tabular-nums;padding:8px}
+      #pm-del>*{position:relative}
+      #pm-del .mapbg{position:absolute;inset:-12px;background-size:cover;background-position:center;opacity:.55}
+      #pm-del .mapbg.pic{filter:blur(6px) saturate(.9);opacity:.85}
+      #pm-del .mapveil{position:absolute;inset:0;background:linear-gradient(180deg,rgba(13,17,23,.38),rgba(13,17,23,.66))}
+      #pm-del .dsc{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:10px}
+      #pm-del .dt{display:flex;align-items:center;gap:7px;min-width:0;font-weight:700;font-size:15px}
+      #pm-del .dt.l{justify-content:flex-end}#pm-del .dt.r{justify-content:flex-start}
+      /* A long name takes two balanced lines before it gets smaller; the score stays in the middle. */
+      #pm-del .dtn{min-width:0;overflow:hidden;white-space:normal;overflow-wrap:anywhere;text-wrap:balance;line-height:1.15;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+      #pm-del .dt.l .dtn{text-align:right}
+      #pm-del .dtn.long{font-size:13px}#pm-del .dtn.xlong{font-size:12px}
+      #pm-del .dnum{font-size:30px;font-weight:800;line-height:1;white-space:nowrap;text-shadow:0 1px 3px #000a}
+      #pm-del .dnum i{font-style:normal;color:#8b949e;margin:0 7px;font-weight:600}
+      #pm-del .side{margin:0;font-weight:700;font-size:10.5px;padding:1px 5px;border-radius:4px;flex:none}
+      #pm-del .tlogo{width:22px;height:22px;object-fit:contain;flex:none}#pm-del .tlogo.sm{width:16px;height:16px}
+      #pm-del #pm-del-meta{text-align:center;color:#9aa7b6;font-size:12.5px;margin:5px 0 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      #pm-del #pm-del-meta b{color:#e6edf3;font-size:14px}
+      #pm-del #pm-del-meta .dot{margin:0 6px;color:#6e7681}
+      #pm-del #pm-del-meta .dclock{font-size:14px}
+      #pm-del .dchip{font-size:10px;font-weight:700;letter-spacing:.06em;color:#f0b429;background:#3a2a05cc;border:1px solid #6b4e0a;border-radius:4px;padding:1px 5px;cursor:help;vertical-align:1px}
+      #pm-del .tabs{margin:6px 0 4px}
+      #pm-del .dteam{margin-top:6px;border-radius:6px;overflow:hidden;background:rgba(13,17,23,.5);border:1px solid color-mix(in srgb,var(--sc) 55%,transparent)}
+      #pm-del .drow{display:grid;grid-template-columns:minmax(0,1fr) 0 84px 38px 30px;align-items:center;column-gap:6px;padding:0 9px;height:28px;border-top:1px solid #ffffff0f;font-size:13.5px}
+      #pm-del .dteams.has-op .drow{grid-template-columns:minmax(0,1fr) 62px 84px 38px 30px}
+      #pm-del .dteams.has-hp .drow{grid-template-columns:minmax(0,1fr) 0 84px 38px 74px}
+      #pm-del .dteams.has-op.has-hp .drow{grid-template-columns:minmax(0,1fr) 62px 84px 38px 74px}
+      #pm-del .dteams.is-lo .drow{grid-template-columns:minmax(0,34%) 0 minmax(0,1fr)}
+      #pm-del .dteams.is-lo.has-op .drow{grid-template-columns:minmax(0,30%) 62px minmax(0,1fr)}
+      #pm-del .dband{border-top:0;height:28px;background:color-mix(in srgb,var(--sc) 20%,transparent);box-shadow:inset 0 -1px 0 color-mix(in srgb,var(--sc) 55%,transparent);color:var(--sc);font-weight:700}
+      #pm-del .dbl{display:flex;align-items:center;gap:6px;min-width:0;white-space:nowrap}
+      #pm-del .dbn{min-width:3ch;overflow:hidden;text-overflow:ellipsis;text-transform:uppercase;letter-spacing:.03em}
+      #pm-del .sep{font-style:normal;opacity:.45;font-weight:400}
+      #pm-del .dkt{color:#c9d1d9;font-weight:600}
+      #pm-del .dal{color:#9aa7b6;font-weight:600;font-size:11.5px;letter-spacing:.04em}#pm-del .dal b{color:var(--sc)}
+      #pm-del .dcap{font-size:10px;font-weight:600;letter-spacing:.04em;color:#9aa7b6;white-space:nowrap;overflow:hidden}
+      #pm-del .dcap .n{display:none}
+      #pm-del .dcap.c,#pm-del .dk,#pm-del .dop{text-align:center}#pm-del .dcap.r{text-align:right}
+      #pm-del .dn{font-weight:600;color:#f0f6fc;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #pm-del .dop{overflow:hidden;height:22px;display:flex;align-items:center;justify-content:center}
+      #pm-del .opi{width:22px;height:22px;object-fit:contain}
+      #pm-del .opt{font-size:10.5px;color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #pm-del .dk{color:#e6edf3;font-weight:600;white-space:nowrap}#pm-del .dk i{font-style:normal;color:#6e7681;margin:0 4px;font-weight:400}
+      #pm-del .dcw{display:flex;align-items:center;justify-content:center;height:26px}
+      #pm-del .dst{display:flex;align-items:center;justify-content:flex-end}
+      #pm-del .dpill{display:inline-block;width:18px;height:7px;border-radius:4px;background:#3fb950;box-shadow:0 0 6px #3fb95088}
+      #pm-del .dskull{fill:#f85149}#pm-del .dskull .eye{fill:#0d1117}
+      #pm-del .dcards .cb{fill:#0d1117;stroke:var(--sc);stroke-width:1.2;opacity:.8}
+      #pm-del .dcards .cf{fill:color-mix(in srgb,var(--sc) 22%,#0d1117);stroke:var(--sc);stroke-width:1.4}
+      #pm-del .dcards .cs{fill:var(--sc)}#pm-del .dcards .cs .eye{fill:#0d1117}
+      #pm-del .dcards .cn{fill:#fff;font:800 10.5px ui-sans-serif,"Segoe UI",system-ui,sans-serif}
+      #pm-del .drow.dead .dn{color:#6e7681;font-weight:500}#pm-del .drow.dead .dk{color:#6e7681}#pm-del .drow.dead .dk i{color:#484f58}
+      #pm-del .drow.dead .opi,#pm-del .drow.dead .opt{opacity:.45}
+      #pm-del .dlo{color:#9aa7b6;font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #pm-del .hpw{gap:5px}#pm-del .hp{width:38px;height:6px;background:#30363d}#pm-del .hpn{width:24px;font-size:12px;color:#c9d1d9}
+      #pm-del .dbl>*{flex-shrink:0}#pm-del .dbl>.dbn{flex-shrink:1}#pm-del .dbl{overflow:hidden}
+      /* A narrow window keeps the team's name and drops what the rows already say. */
+      @container (max-width:470px){#pm-del .dkt{display:none}#pm-del .dal .lbl{display:none}#pm-del .dt{font-size:13px}#pm-del .dnum{font-size:26px}#pm-del .drow{font-size:12.5px;padding:0 7px}}
+      @container (max-width:470px){
+      #pm-del .dteams:not(.is-lo) .drow{grid-template-columns:minmax(0,1fr) 0 70px 34px 26px}
+      #pm-del .dteams.has-op:not(.is-lo) .drow{grid-template-columns:minmax(0,1fr) 26px 70px 34px 26px}
+      #pm-del .dteams.has-hp:not(.is-lo) .drow{grid-template-columns:minmax(0,1fr) 0 70px 34px 58px}
+      #pm-del .dteams.has-op.has-hp:not(.is-lo) .drow{grid-template-columns:minmax(0,1fr) 26px 70px 34px 58px}
+      #pm-del .dcap .w{display:none}#pm-del .dcap .n{display:inline}#pm-del .hp{width:24px}#pm-del .dk i{margin:0 3px}}
+      @container (max-width:330px){#pm-del .dal,#pm-del .dband .sep{display:none}}
+      /* With an operator and a health column the band is short of room first: the team's K/D/A goes before its name does. */
+      @container (max-width:600px){#pm-del .dteams.has-op.has-hp .dkt{display:none}}
+      #pm-del .dchip.live{color:#3fb950;background:#12331fcc;border-color:#1f5c36}
+      #pm-del .tabs{align-items:center}#pm-del .tabs .sp{flex:1}
+
+      /* ---------- operators without a picture ---------- */
+      #pm-del .opini{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:4px;background:#30363d;color:#e6edf3;font-size:10px;font-weight:700;letter-spacing:.02em;cursor:help}
+      #pm-del .drow.dead .opini{opacity:.45}
+
+      /* ---------- stream ---------- */
+      #pm-r6 .blk-stream{border-color:#9146ff;background:#130d1f}
+      #pm-r6 .blk-stream .bt{background:#9146ff;color:#fff}
+      #pm-stream-box{width:100%;aspect-ratio:16/9;background:#000;border-radius:4px}
+      #pm-r6 .blk-stream.sized #pm-stream-box{aspect-ratio:auto;height:100%}
+      #pm-stream-msg:empty{display:none}
+
+      /* ---------- section size grips ---------- */
+      #pm-r6 .blk{position:relative}
+      #pm-r6 .rsz{position:absolute;left:0;right:0;bottom:-6px;height:8px;cursor:ns-resize;z-index:3}
+      #pm-r6 .rsz:hover,#pm-r6 .rsz:active{background:linear-gradient(transparent 3px,#58a6ff 3px,#58a6ff 5px,transparent 5px)}
+      #pm-r6 .blk.collapsed .rsz{display:none}
+      #pm-r6 .blk.sized>.bb{overflow:auto}
+      #pm-r6.resizing-y,#pm-r6.resizing-y *{cursor:ns-resize!important;user-select:none}
+      #pm-r6.resizing-x,#pm-r6.resizing-x *{cursor:ew-resize!important;user-select:none}
+
+      /* ---------- side by side ---------- */
+      #pm-r6.lay-h{min-height:0;overflow:hidden}
+      #pm-r6.popped.lay-h{height:100vh!important}
+      #pm-r6.lay-h #pm-blocks{flex:1;min-height:0;display:flex;flex-direction:row;align-items:stretch;overflow-x:auto;overflow-y:hidden}
+      #pm-r6.lay-h .blk{flex:none;width:380px;display:flex;flex-direction:column;min-height:0}
+      #pm-r6.lay-h .blk>.bb{flex:1;min-height:0;overflow:auto;height:auto!important}
+      #pm-r6.lay-h .blk-ph{flex:none}
+      #pm-r6.lay-h .blk.dragging{top:0;bottom:0;right:auto}
+      #pm-r6.lay-h .rsz{left:auto;top:0;bottom:0;right:-6px;width:8px;height:auto;cursor:ew-resize}
+      #pm-r6.lay-h .rsz:hover,#pm-r6.lay-h .rsz:active{background:linear-gradient(90deg,transparent 3px,#58a6ff 3px,#58a6ff 5px,transparent 5px)}
+      /* Folded side by side: a narrow strip with the title written downwards. */
+      #pm-r6.lay-h .blk.collapsed{width:30px!important}
+      #pm-r6.lay-h .blk.collapsed>.bt{flex:1;writing-mode:vertical-rl;justify-content:flex-start;padding:8px 3px}
+      #pm-r6.lay-h .blk.collapsed>.bt>span:last-child{display:none}
+      #pm-r6.lay-h .blk-stream.sized #pm-stream-box,#pm-r6.lay-h .blk-stream #pm-stream-box{aspect-ratio:16/9;height:auto}
+      /* A section with a size of its own scrolls inside: the map picture then stays within it. */
+      #pm-r6 .blk.sized>#pm-del .mapbg,#pm-r6.lay-h #pm-del .mapbg{inset:0}
+      #pm-r6.lay-h .blk:not(.collapsed)>.bt>span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+      #pm-r6.lay-h .blk:not(.collapsed)>.bt>span:last-child{flex:none;max-width:45%;margin-left:8px}
+      #pm-stream-box iframe{display:block;width:100%;height:100%;border:0;border-radius:4px}
+      #pm-r6.busy iframe{pointer-events:none}
+      #pm-r6 .blk-stream .bb{position:relative}
+
       `;
   function buildHud() {
     if (hud || !document.body) return;
     hud = document.createElement('div'); hud.id = 'pm-r6';
     hud.innerHTML = `<style>${CSS}</style>
     <div class="hd"><b>PM</b><span id="pm-sum"></span><span class="sp"></span>
-      <button id="pm-swap" title="Swap the two teams (left ↔ right) in REAL-TIME and DELAYED — remembered for this match">⇄</button>
+      <button id="pm-stream-open" title="Open the match's stream in a new tab">▶</button>
+      <button id="pm-layout" title="Sections one under the other, or side by side">⇅</button>
+      <button id="pm-swap" title="Swap the two teams (left ↔ right) in REAL-TIME and GRID — remembered for this match">⇄</button>
       <span class="menu"><button id="pm-menu">☰</button><div class="dd" id="pm-dd">
         <button id="pm-snd-live" class="on">🔊 sound on real-time round end</button>
         <button id="pm-poll" class="on">⟳ poll series-state every 1s</button>
         <button id="pm-export">⬇ Export JSON (everything)</button>
         <button id="pm-pop">⧉ Pop-out window</button>
-        <button id="pm-reset">↺ Reset size/position</button>
+        <button id="pm-reset">↺ Reset size, position and sections</button>
         <button id="pm-auto">${prefs.autoWidgets === false ? '☐' : '☑'} open GRID widgets hidden (no need for the Live Log / Map tabs)</button>
         <button id="pm-x">× Hide (Ctrl+Shift+R)</button></div></span></div>
     <div id="pm-blocks">
     <div class="blk blk-live" data-blk="live"><div class="bt"><span><span class="grip" title="Drag to move this section">⠿</span><span class="chev"></span>⚡ REAL-TIME — series-state + Polymarket odds</span><span id="pm-live-t"></span></div><div class="bb" id="pm-live">waiting for series-state…</div></div>
-    <div class="blk blk-del" data-blk="del"><div class="bt"><span><span class="grip" title="Drag to move this section">⠿</span><span class="chev"></span>⏳ DELAYED — GRID widgets</span><span id="pm-del-t"></span></div><div class="bb" id="pm-del"><div id="pm-del-head"></div><div id="pm-del-tabs"></div><div id="pm-del-table"></div></div></div>
+    <div class="blk blk-del" data-blk="del"><div class="bt"><span><span class="grip" title="Drag to move this section">⠿</span><span class="chev"></span>⏳ GRID — live score · delayed players</span><span id="pm-del-t"></span></div><div class="bb" id="pm-del"><div class="mapbg" id="pm-mapbg"></div><div class="mapveil"></div><div id="pm-del-head"></div><div id="pm-del-meta"></div><div id="pm-del-tabs"></div><div id="pm-del-table"></div></div></div>
+    <div class="blk blk-stream" data-blk="stream"><div class="bt"><span><span class="grip" title="Drag to move this section">⠿</span><span class="chev"></span>📺 STREAM</span><span id="pm-stream-t"></span></div><div class="bb"><div id="pm-stream-box" style="display:none"></div><div id="pm-stream-msg" class="dim">waiting for the event…</div></div></div>
     <div class="blk blk-veto" data-blk="veto"><div class="bt"><span><span class="grip" title="Drag to move this section">⠿</span><span class="chev"></span>🗳 VETO · LIVE LOG — GRID</span><span id="pm-veto-t"></span></div><div class="bb"><div class="tabs" id="pm-vtabs"></div><div id="pm-veto"></div><div id="pm-vlog"></div></div></div>
     </div>
     <div class="rz n"></div><div class="rz s"></div><div class="rz e"></div><div class="rz w"></div><div class="rz ne"></div><div class="rz nw"></div><div class="rz se"></div><div class="rz sw"></div>`;
     document.body.appendChild(hud); applyPrefs();
     const q = (id) => hud.querySelector('#' + id);
     q('pm-swap').onclick = (e) => { e.stopPropagation(); toggleSwap(); paint(); };
+    q('pm-stream-open').onclick = (e) => { e.stopPropagation(); const st = streamNow(); W.open(st ? st.url : location.href, '_blank', 'noopener'); };
+    q('pm-layout').onclick = (e) => { e.stopPropagation(); setLayout(layout() === 'h' ? 'v' : 'h'); };
     q('pm-menu').onclick = (e) => { e.stopPropagation(); menuOpen = !menuOpen; q('pm-dd').classList.toggle('open', menuOpen); };
     hud.addEventListener('click', (e) => { if (menuOpen && !e.target.closest('.menu')) { menuOpen = false; q('pm-dd').classList.remove('open'); } });
     q('pm-x').onclick = () => toggle(false);
@@ -592,7 +829,7 @@
     q('pm-poll').onclick = (e) => { S.polling = !S.polling; e.target.classList.toggle('on', S.polling); };
     q('pm-export').onclick = () => download(`pm-esports_${S.seriesId || 'series'}_${new Date().toISOString().replace(/[:.]/g, '-')}.json`, JSON.stringify(buildExport()));
     q('pm-pop').onclick = () => popOut();
-    q('pm-reset').onclick = () => { delete prefs.w; delete prefs.h; delete prefs.mh; delete prefs.x; delete prefs.y; delete prefs.order; delete prefs.collapsed; savePrefs(); hud.style.cssText = ''; applySections(); };
+    q('pm-reset').onclick = () => { ['w', 'h', 'mh', 'hw', 'hh', 'x', 'y', 'order', 'collapsed', 'sizes'].forEach(k => delete prefs[k]); savePrefs(); hud.style.cssText = ''; applyPrefs(); applySections(); };
     hud.addEventListener('click', (e) => {
       const t = e.target; const b = t.closest('button, .fold'); if (!b) return;
       const d = b.dataset || {};
@@ -609,58 +846,115 @@
     // A click on a section's title (not on its grip) folds or unfolds it.
     hud.querySelectorAll('#pm-blocks > .blk > .bt').forEach(bt => bt.addEventListener('click', (e) => {
       if (e.target.closest('.grip') || e.target.closest('button')) return;
-      const key = bt.parentElement.dataset.blk; prefs.collapsed = prefs.collapsed || {}; prefs.collapsed[key] = !prefs.collapsed[key]; savePrefs(); applySections();
+      const key = bt.parentElement.dataset.blk; prefs.collapsed = prefs.collapsed || {}; prefs.collapsed[key] = !isCollapsed(key); savePrefs(); applySections(); render();
     }));
+    // A picture that does not load: an operator goes to the picture this script carries, then
+    // to its initials; anything else is hidden. (Load errors do not bubble: caught on the way down.)
+    hud.addEventListener('error', (e) => { const t = e.target; if (!t || t.tagName !== 'IMG') return; if (t.classList.contains('opi')) opPicFailed(t); else t.style.display = 'none'; }, true);
     drag(hud, hud.querySelector('.hd'));
-    sectionDrag(); resizeFrame(); applySections();
+    sectionDrag(); sectionResize(); resizeFrame(); applySections();
     render();
   }
   // Size: width and a MAXIMUM height (prefs.mh). The panel is as tall as its content up to
   // that maximum, so folding a section shortens it.
-  function applyPrefs() { if (prefs.w) hud.style.width = prefs.w + 'px'; hud.style.height = ''; hud.style.maxHeight = prefs.mh ? prefs.mh + 'px' : ''; if (prefs.x != null) { hud.style.left = prefs.x + 'px'; hud.style.top = prefs.y + 'px'; hud.style.bottom = 'auto'; } }
-  const BLOCKS = ['live', 'del', 'veto'];
+  // Side by side the panel has a fixed height (the sections share it) and its own width and
+  // height, kept apart from the ones it has one section under the other.
+  function applyPrefs() {
+    if (hud.classList.contains('popped')) return;
+    if (layout() === 'h') { hud.style.width = (prefs.hw || Math.min(innerWidth - 16, 1600)) + 'px'; hud.style.height = (prefs.hh || Math.min(innerHeight - 16, 520)) + 'px'; hud.style.maxHeight = ''; }
+    else { hud.style.width = prefs.w ? prefs.w + 'px' : ''; hud.style.height = ''; hud.style.maxHeight = prefs.mh ? prefs.mh + 'px' : ''; }
+    if (prefs.x != null) { hud.style.left = Math.min(prefs.x, Math.max(0, innerWidth - 120)) + 'px'; hud.style.top = Math.min(prefs.y, Math.max(0, innerHeight - 60)) + 'px'; hud.style.bottom = 'auto'; }
+  }
+  function setLayout(v) { prefs.layout = v; savePrefs(); applyPrefs(); applySections(); render(); }
+  const BLOCKS = ['live', 'del', 'stream', 'veto'];
+  // The stream starts folded: unfolding it is what starts the player.
+  const isCollapsed = (k) => { const c = prefs.collapsed || {}; return Object.prototype.hasOwnProperty.call(c, k) ? !!c[k] : k === 'stream'; };
+  // Two layouts: one section under the other (as before) or side by side. Sizes share one
+  // dimension so nothing overlaps and no gaps open: one under the other, they all have the
+  // panel's width and each has its own height; side by side, they all have the panel's
+  // height and each has its own width. Each layout keeps its own sizes.
+  const layout = () => prefs.layout === 'h' ? 'h' : 'v';
+  const sizeOf = (k) => ((prefs.sizes || {})[layout()] || {})[k];
+  function setSize(k, px) { prefs.sizes = prefs.sizes || {}; const L = layout(); prefs.sizes[L] = prefs.sizes[L] || {}; if (px == null) delete prefs.sizes[L][k]; else prefs.sizes[L][k] = Math.round(px); }
+  function applySizes() {
+    const h = layout() === 'h';
+    hud.querySelectorAll('#pm-blocks > .blk').forEach(el => {
+      const px = sizeOf(el.dataset.blk); const bb = el.querySelector('.bb');
+      el.style.width = h && px ? px + 'px' : '';
+      bb.style.height = !h && px ? px + 'px' : '';
+      el.classList.toggle('sized', !!px);
+    });
+  }
   function applySections() {
     const box = hud.querySelector('#pm-blocks'); if (!box) return;
     const order = (prefs.order || []).filter(k => BLOCKS.includes(k)); BLOCKS.forEach(k => { if (!order.includes(k)) order.push(k); });
     order.forEach(k => box.appendChild(box.querySelector(`[data-blk="${k}"]`)));
-    box.querySelectorAll('.blk').forEach(el => { const c = !!(prefs.collapsed || {})[el.dataset.blk]; el.classList.toggle('collapsed', c); el.querySelector('.chev').textContent = c ? '▸' : '▾'; });
+    box.querySelectorAll('.blk').forEach(el => { const c = isCollapsed(el.dataset.blk); el.classList.toggle('collapsed', c); el.querySelector('.chev').textContent = c ? '▸' : '▾'; });
+    hud.classList.toggle('lay-h', layout() === 'h');
+    const lb = hud.querySelector('#pm-layout'); lb.textContent = layout() === 'h' ? '⇆' : '⇅';
+    lb.title = layout() === 'h' ? 'Sections side by side — click to put them one under the other' : 'Sections one under the other — click to put them side by side';
+    applySizes();
+  }
+  // The window the panel lives in: the page's, or the pop-out's.
+  const hudWin = () => (hud && hud.ownerDocument && hud.ownerDocument.defaultView) || window;
+  // A grip on the free edge of every section (the bottom one under the other, the right one
+  // side by side): dragging it sets that section's height or width. A double click gives the
+  // section back its natural size.
+  function sectionResize() {
+    const box = hud.querySelector('#pm-blocks');
+    box.querySelectorAll('.blk').forEach(el => { const g = document.createElement('div'); g.className = 'rsz'; g.title = 'Drag to resize this section · double click: natural size'; el.appendChild(g); });
+    box.addEventListener('dblclick', (e) => { const g = e.target.closest('.rsz'); if (!g) return; setSize(g.parentElement.dataset.blk, null); savePrefs(); applySizes(); });
+    box.addEventListener('pointerdown', (e) => {
+      const g = e.target.closest('.rsz'); if (!g || e.button > 0) return; e.preventDefault(); e.stopPropagation();
+      const el = g.parentElement; const k = el.dataset.blk; const h = layout() === 'h'; const win = hudWin();
+      const bb = el.querySelector('.bb'); const start = h ? el.getBoundingClientRect().width : bb.getBoundingClientRect().height; const p0 = h ? e.clientX : e.clientY;
+      hud.classList.add('busy', h ? 'resizing-x' : 'resizing-y');
+      const move = (ev) => { setSize(k, Math.max(h ? 200 : 40, start + (h ? ev.clientX : ev.clientY) - p0)); applySizes(); };
+      const up = () => { win.removeEventListener('pointermove', move); win.removeEventListener('pointerup', up); hud.classList.remove('busy', 'resizing-x', 'resizing-y'); savePrefs(); };
+      win.addEventListener('pointermove', move); win.addEventListener('pointerup', up);
+    });
   }
   // Drag a section by its grip. While dragged it floats above the others (taken out of the
   // flow, exactly where it was) and a dashed placeholder holds its slot; the placeholder moves
   // as the pointer crosses the middle of another section, and the others slide (FLIP). On
-  // release the section glides into the placeholder. The order is kept.
+  // release the section glides into the placeholder. The order is kept. Side by side, the same
+  // happens along the width.
   function sectionDrag() {
     const box = hud.querySelector('#pm-blocks');
     box.addEventListener('pointerdown', (e) => {
       const grip = e.target.closest('.grip'); if (!grip || e.button > 0) return;
       const blk = grip.closest('.blk'); e.preventDefault();
-      const mt = parseFloat(getComputedStyle(blk).marginTop) || 0;
-      const startTop = blk.offsetTop - mt, startY = e.clientY;
-      const ph = document.createElement('div'); ph.className = 'blk-ph'; ph.style.height = blk.offsetHeight + 'px';
+      const X = layout() === 'h'; const win = hudWin();
+      const cs = win.getComputedStyle(blk); const m0 = parseFloat(X ? cs.marginLeft : cs.marginTop) || 0;
+      const start = (X ? blk.offsetLeft : blk.offsetTop) - m0, p0 = X ? e.clientX : e.clientY;
+      const ph = blk.ownerDocument.createElement('div'); ph.className = 'blk-ph';
+      if (X) ph.style.width = blk.offsetWidth + 'px'; else ph.style.height = blk.offsetHeight + 'px';
       blk.before(ph);
-      blk.classList.add('dragging'); blk.style.top = startTop + 'px';
+      if (X) { blk.style.width = blk.offsetWidth + 'px'; blk.style.left = start + 'px'; } else blk.style.top = start + 'px';
+      blk.classList.add('dragging'); hud.classList.add('busy');
       const others = () => [...box.children].filter(x => x !== blk && x !== ph);
-      const flip = (fn) => { const first = new Map(others().map(x => [x, x.getBoundingClientRect().top])); fn(); others().forEach(x => { const dy = first.get(x) - x.getBoundingClientRect().top; if (!dy) return; x.style.transition = 'none'; x.style.transform = `translateY(${dy}px)`; requestAnimationFrame(() => { x.style.transition = ''; x.style.transform = ''; }); }); };
+      const pos = (r) => X ? r.left : r.top;
+      const flip = (fn) => { const first = new Map(others().map(x => [x, pos(x.getBoundingClientRect())])); fn(); others().forEach(x => { const d = first.get(x) - pos(x.getBoundingClientRect()); if (!d) return; x.style.transition = 'none'; x.style.transform = X ? `translateX(${d}px)` : `translateY(${d}px)`; win.requestAnimationFrame(() => { x.style.transition = ''; x.style.transform = ''; }); }); };
       const move = (ev) => {
-        blk.style.top = (startTop + ev.clientY - startY) + 'px';
-        const y = ev.clientY;
+        const p = X ? ev.clientX : ev.clientY;
+        if (X) blk.style.left = (start + p - p0) + 'px'; else blk.style.top = (start + p - p0) + 'px';
         for (const x of others()) {
-          const r = x.getBoundingClientRect(); const mid = r.top + r.height / 2;
+          const r = x.getBoundingClientRect(); const mid = X ? r.left + r.width / 2 : r.top + r.height / 2;
           const xBeforePh = !!(ph.compareDocumentPosition(x) & Node.DOCUMENT_POSITION_PRECEDING);
-          if (xBeforePh && y < mid) { flip(() => x.before(ph)); break; }
-          if (!xBeforePh && y > mid) { flip(() => x.after(ph)); break; }
+          if (xBeforePh && p < mid) { flip(() => x.before(ph)); break; }
+          if (!xBeforePh && p > mid) { flip(() => x.after(ph)); break; }
         }
       };
       const up = () => {
-        window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up);
-        blk.classList.add('dropping'); blk.style.top = (ph.offsetTop - mt) + 'px';
+        win.removeEventListener('pointermove', move); win.removeEventListener('pointerup', up);
+        blk.classList.add('dropping'); if (X) blk.style.left = (ph.offsetLeft - m0) + 'px'; else blk.style.top = (ph.offsetTop - m0) + 'px';
         setTimeout(() => {
-          blk.classList.remove('dragging', 'dropping'); blk.style.top = '';
+          blk.classList.remove('dragging', 'dropping'); blk.style.top = ''; blk.style.left = ''; hud.classList.remove('busy');
           ph.replaceWith(blk);
-          prefs.order = [...box.querySelectorAll('.blk')].map(x => x.dataset.blk); savePrefs();
+          prefs.order = [...box.querySelectorAll('.blk')].map(x => x.dataset.blk); savePrefs(); applySizes();
         }, 170);
       };
-      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+      win.addEventListener('pointermove', move); win.addEventListener('pointerup', up);
     });
   }
   // Resize from any edge or corner (the browser's own grip sat in a corner the page edge hid).
@@ -678,27 +972,30 @@
         if (d.includes('s')) height = r.height + dy;
         if (d.includes('n')) { height = r.height - dy; top = r.top + dy; }
         width = Math.max(360, Math.min(width, innerWidth)); height = Math.max(120, Math.min(height, innerHeight));
-        hud.style.width = width + 'px'; hud.style.maxHeight = height + 'px'; hud.style.left = Math.max(0, left) + 'px'; hud.style.top = Math.max(0, top) + 'px';
-        Object.assign(prefs, { w: Math.round(width), mh: Math.round(height), x: Math.max(0, Math.round(left)), y: Math.max(0, Math.round(top)) });
+        const H = layout() === 'h';
+        hud.style.width = width + 'px'; if (H) hud.style.height = height + 'px'; else hud.style.maxHeight = height + 'px'; hud.style.left = Math.max(0, left) + 'px'; hud.style.top = Math.max(0, top) + 'px';
+        Object.assign(prefs, H ? { hw: Math.round(width), hh: Math.round(height) } : { w: Math.round(width), mh: Math.round(height) }, { x: Math.max(0, Math.round(left)), y: Math.max(0, Math.round(top)) });
       };
       const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); savePrefs(); };
       window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
     }));
   }
-  function toggle(v) { visibleHud = v === undefined ? !visibleHud : v; if (hud) hud.style.display = visibleHud ? 'flex' : 'none'; }
+  function toggle(v) { visibleHud = v === undefined ? !visibleHud : v; if (hud) { hud.style.display = visibleHud ? 'flex' : 'none'; if (!visibleHud) paintStream(); else render(); } }
   function drag(el, handle) { let sx, sy, ox, oy, on = false; handle.addEventListener('mousedown', (e) => { if (el.classList.contains('popped') || e.target.closest('button,.dd,input')) return; on = true; sx = e.clientX; sy = e.clientY; const r = el.getBoundingClientRect(); ox = r.left; oy = r.top; e.preventDefault(); }); window.addEventListener('mousemove', (e) => { if (!on) return; const x = Math.max(0, ox + e.clientX - sx), y = Math.max(0, oy + e.clientY - sy); el.style.left = x + 'px'; el.style.top = y + 'px'; el.style.bottom = 'auto'; prefs.x = x; prefs.y = y; }); window.addEventListener('mouseup', () => { if (on) savePrefs(); on = false; }); }
   function popOut() {
     if (popup && !popup.closed) { popup.focus(); return; }
     const w = W.open('', 'pmr6_popup', `popup=yes,width=${Math.max(460, hud.offsetWidth)},height=${Math.max(600, hud.offsetHeight + 40)}`); if (!w) { alert('Popup blocked — allow popups for polymarket.com'); return; }
     popup = w; w.document.open(); w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>Polymarket Esports Scoreboard</title><style>html,body{margin:0;background:#0d1117;height:100%;overflow:hidden}</style></head><body></body></html>'); w.document.close();
-    menuOpen = false; hud.querySelector('#pm-dd').classList.remove('open'); hud.classList.add('popped'); hud.style.cssText = ''; w.document.body.appendChild(w.document.adoptNode(hud));
-    w.addEventListener('beforeunload', () => { if (!hud.classList.contains('popped')) return; hud.classList.remove('popped'); document.body.appendChild(document.adoptNode(hud)); applyPrefs(); popup = null; render(); });
+    menuOpen = false; hud.querySelector('#pm-dd').classList.remove('open'); hud.classList.add('popped'); hud.style.cssText = ''; w.document.body.appendChild(w.document.adoptNode(hud)); resetStream();
+    w.addEventListener('beforeunload', () => { if (!hud.classList.contains('popped')) return; hud.classList.remove('popped'); document.body.appendChild(document.adoptNode(hud)); applyPrefs(); popup = null; resetStream(); render(); });
     window.addEventListener('beforeunload', () => { try { w.close(); } catch {} }); render();
   }
   function render() { if (renderQueued) return; renderQueued = true; requestAnimationFrame(() => { renderQueued = false; paint(); }); }
   const sideTag = (txt) => { const sd = sideOf(txt); return sd ? `<span class="side side-${/^(CT|T|DEF|ATK)$/.test(sd) ? sd : 'X'}">${esc(sd)}</span>` : ''; };
   const colorOf = (id) => (S.colors[id] && S.colors[id].sideColor) || '#c9d1d9';
-  const nameCls = (n) => (n || '').length > 20 ? 'xlong' : (n || '').length > 13 ? 'long' : '';
+  // Team names wrap to two balanced lines first; only a name too long for two lines gets a
+  // smaller font (and then "…").
+  const nameCls = (n) => (n || '').length > 32 ? 'xlong' : (n || '').length > 24 ? 'long' : '';
   // Polymarket lists a market's two outcomes in its own order ("Weibo Gaming", "DarkZero
   // Esports"), which need not be the order series-state gives the teams ("DarkZero", "Weibo
   // Gaming" - match of 11 Nov: DarkZero's score sat above Weibo's price). The two are paired
@@ -810,57 +1107,156 @@
         (rows.length ? rows.map(e => `<div><span class="dim">${esc(e.gameTime || '')} ${e.ts ? fmtT(Date.parse(e.ts)) : ''}</span> <span class="${esc(e.cat)}">${esc(e.text)}</span></div>`).join('') : '<div class="dim">no live log yet</div>') + '</div>');
     }
 
-    // ---- delayed (split: head / tabs / table / log)
-    const measured = S.delaySamples.length ? Math.round(S.delaySamples.reduce((x, y) => x + y, 0) / S.delaySamples.length) : null;
-    hud.querySelector('#pm-del-t').textContent = `${S.gridStatus} · declared ${S.declaredDelay ?? '?'}s${measured != null ? ` · measured ${measured}s` : ''}`;
-    const sb = S.scoreboard, tb = S.teamsBoard; let dHead = '', dTabs = '', dTable = '';
-    if (!sb && !tb) dHead = `<div class="dim">${S.gridStatus === 'idle' ? 'waiting for seriesId…' : 'no widget data yet (' + esc(S.gridStatus) + ')'}</div>`;
-    else {
-      const g = sb && (sb.games || [])[sb.activeGameIndex || 0]; let clockTxt = '';
-      // A team's colour is its side's. CS2: taken from the side label itself (CT blue, T yellow,
-      // the HUD's own two colours), so name and tag always agree and switch in the same frame.
-      // Other games keep GRID's team_colors as before, then the scoreboard's own side colour.
+    paintDelayed(game, sw);
+    paintStream();
+  }
+
+  // ---------------------------------------------------------------- delayed (GRID widgets)
+  // Small drawings, all inline so they take the colour of the side they sit in.
+  const SKULL = '<path d="M8 1.5c-3.3 0-5.6 2.3-5.6 5.3 0 1.8.8 3 1.8 3.7v1.6c0 .6.5 1.1 1.1 1.1h5.4c.6 0 1.1-.5 1.1-1.1v-1.6c1-.7 1.8-1.9 1.8-3.7 0-3-2.3-5.3-5.6-5.3z"/><circle cx="5.8" cy="7" r="1.5" class="eye"/><circle cx="10.2" cy="7" r="1.5" class="eye"/><path d="M7.2 10.4h1.6v2.4H7.2z" class="eye"/>';
+  const skullIcon = (title) => `<svg class="dskull" viewBox="0 0 16 14" width="16" height="14"><title>${esc(title)}</title>${SKULL}</svg>`;
+  // Kills in the round, as a hand of cards: one card per kill up to three, the count on the
+  // front one. Our own drawing of the idea, kept simple so it reads at 24px.
+  function killCards(n) {
+    if (!n) return '';
+    const back = Math.min(n, 3) - 1; let s = `<svg class="dcards" viewBox="0 0 34 26" width="34" height="26"><title>${n} kill${n === 1 ? '' : 's'} this round</title>`;
+    for (let i = back; i >= 1; i--) s += `<rect class="cb" x="15" y="3" width="15" height="21" rx="2.4" transform="rotate(${-14 * i} 22.5 26) translate(${-1.5 * i} 0)"/>`;
+    return s + `<rect class="cf" x="15" y="3" width="15" height="21" rx="2.4"/><g class="cs" transform="translate(18.3 4.8) scale(.52)">${SKULL}</g><text class="cn" x="22.5" y="22" text-anchor="middle">${n}</text></svg>`;
+  }
+  const kdaHtml = (v) => esc(v || '').replace(/\//g, '<i>|</i>');
+  // An operator's picture: GRID's, else the one this script carries, else a box with the
+  // initials. A picture that failed once is not asked for again (the table is redrawn often).
+  const badPics = new Set(); const notedOps = new Set();
+  function opHtml(op) {
+    if (!op) return '';
+    const tip = op.label && op.label !== op.name ? `${op.name} · GRID: ${op.label}` : op.name;
+    const fb = op.fallback || '';
+    const src = op.iconUrl && !badPics.has(op.iconUrl) ? op.iconUrl : fb && !badPics.has(fb) ? fb : '';
+    if (!src) return `<span class="opini" title="${esc(tip)}">${esc(op.initials)}</span>`;
+    return `<img class="opi" src="${esc(src)}" alt="${esc(op.name)}" title="${esc(tip)}" data-fb="${src === fb ? '' : esc(fb)}" data-op="${esc(op.id || op.name)}" data-name="${esc(op.name)}" referrerpolicy="no-referrer">`;
+  }
+  function opPicFailed(img) {
+    const failed = img.getAttribute('src'); badPics.add(failed);
+    const id = img.dataset.op, name = img.dataset.name, fb = img.dataset.fb;
+    if (id && !notedOps.has(id + failed)) { notedOps.add(id + failed); console.warn(TAG, `operator picture did not load: ${name} (${id})${/^https:/.test(failed) ? ' from GRID' : ' carried by the script'}${fb ? ', using the one the script carries' : ''}`); }
+    if (fb && !badPics.has(fb)) { img.dataset.fb = ''; img.src = fb; return; }
+    const box = img.ownerDocument.createElement('span'); box.className = 'opini'; box.title = img.title; box.textContent = (name || '?').split(/\s+/).filter(Boolean).map(w => w[0]).join('').slice(0, 2).toUpperCase(); img.replaceWith(box);
+  }
+  const prettyMap = (n) => String(n || '').replace(/[_]+/g, ' ').replace(/\s*\b(v\d+|mod)\b/gi, '').replace(/^(de|cs) /i, '').trim();
+  // A background for the map: the picture this script carries for it (@resource), else a
+  // quiet colour that is always the same for the same map.
+  function mapBackground(name) {
+    const key = mapKey(name); if (!key) return { css: '', tip: '' };
+    const game = gameOfSlug(S.slug);
+    const order = Object.keys(MAP_PICS).filter(g => g === game).concat(Object.keys(MAP_PICS).filter(g => g !== game));
+    // The game's own pictures first; the same map before a name that only starts alike.
+    for (const want of [2, 1]) for (const g of order) { const hit = MAP_PICS[g].find(p => mapFit(p, name) === want); const u = hit ? resUrl(`map_${g}_${hit}`) : ''; if (u) return { css: `url("${u}")`, tip: `Background: ${g} ${hit}`, img: true }; }
+    let h = 0; for (const c of key) h = (h * 31 + c.charCodeAt(0)) % 360;
+    return { css: `linear-gradient(135deg,hsl(${h} 38% 24%),hsl(${(h + 50) % 360} 32% 12%))`, tip: 'No picture for this map', img: false };
+  }
+
+  function paintDelayed(game, sw) {
+    // The middle value of the last samples: one late entry (a backlog, a hiccup) must not move it.
+    const sorted = S.delaySamples.slice().sort((x, y) => x - y);
+    const measured = sorted.length ? Math.round(sorted[Math.floor(sorted.length / 2)]) : null;
+    hud.querySelector('#pm-del-t').textContent = `${S.gridStatus} · score ${S.boardDelay === 0 ? 'live' : S.boardDelay != null ? S.boardDelay + 's' : '?'} · players ${measured != null ? '~' + measured : S.declaredDelay ?? '?'}s`;
+    const sb = S.scoreboard, tb = S.teamsBoard; let dHead = '', dMeta = '', dTabs = '', dTable = '';
+    const bg = hud.querySelector('#pm-mapbg');
+    if (!sb && !tb) {
+      dHead = `<div class="dim">${S.gridStatus === 'idle' ? 'waiting for seriesId…' : 'no widget data yet (' + esc(S.gridStatus) + ')'}</div>`;
+      if (bg.dataset.k) { bg.dataset.k = ''; bg.style.backgroundImage = ''; bg.className = 'mapbg'; }
+    } else {
+      const g = sb && (sb.games || [])[sb.activeGameIndex || 0];
+      // A team's colour is its side's. CS2: taken from the side label itself (CT blue, T yellow),
+      // so name and tag always agree and switch in the same frame. Other games keep GRID's
+      // team_colors, then the scoreboard's own side colour.
       const sideColor = (gt) => { if (!gt) return '#c9d1d9'; const sd = sideOf(gt.infoText && gt.infoText.text); if (sd === 'CT') return '#58a6ff'; if (sd === 'T') return '#e3b341'; const c = S.colors[gt.id] && S.colors[gt.id].sideColor; if (c) return c; const ic = gt.infoText && gt.infoText.color; return /^#[0-9a-f]{3,8}$/i.test(ic || '') ? ic : '#c9d1d9'; };
-      if (S.clock) { let sec = S.clock.seconds; if (S.clock.ticking) { const el = (now() - S.clock.recvT) / 1000; sec = S.clock.backwards ? sec - el : sec + el; } clockTxt = `⏱ ${mmss(sec)}${S.clock.ticking ? '' : ' (paused)'}`; }
-      // Bomb planted: the clock itself becomes the marker, a red pill that blinks (same place,
-      // same width, so nothing moves). The header is rewritten every second, which restarts a
-      // CSS animation, hence the negative delay that keeps the blink in phase with the clock.
-      const rsAll = roundState(S.log);
-      if (rsAll.bomb) clockTxt = `<span class="bomb" style="animation-delay:-${now() % 1000}ms" title="${esc(rsAll.bomb.by ? 'bomb planted by ' + rsAll.bomb.by : 'bomb planted')}">💣 ${S.clock ? clockTxt.replace('⏱ ', '') : 'BOMB'}</span>`;
+      const logoOf = (id) => { const a = ((sb && sb.series && sb.series.teams) || []).find(x => x.id === id); const b = ((tb && tb.teams) || []).find(x => x.id === id); const u = (a && a.logoUrl) || (b && b.iconUrl) || ''; return /^https:\/\/cdn\.grid\.gg\//.test(u) ? u : ''; };
+      const logo = (id, cls) => { const u = logoOf(id); return u ? `<img class="tlogo ${cls || ''}" src="${esc(u)}" alt="" referrerpolicy="no-referrer">` : ''; };
+      const rs = roundState(S.log);
       // The delayed blocks keep each team on the side it has in the real-time row: GRID's
       // scoreboard order is turned round when its two team ids are the real-time ones crossed.
       const rtIds = game && game.teams && game.teams.length === 2 ? game.teams.map(t => String(t.id)) : null;
       const crossed = (arr) => !!(rtIds && arr && arr.length === 2 && String(arr[0].id) === rtIds[1] && String(arr[1].id) === rtIds[0]);
       const ordD = (arr) => crossed(arr) !== sw ? arr.slice().reverse() : arr;
-      if (g) { const [a, b] = ordD(g.teams); const nm = (id) => (S.teamsBoard?.teams || sb.series?.teams || []).find(x => x.id === id)?.name || id; dHead = `<div class="score"><span class="tn r ${nameCls(nm(a.id))}" style="color:${sideColor(a)}">${esc(nm(a.id))}${sideTag(a.infoText?.text)}</span><span class="num">${a.score} : ${b.score}</span><span class="tn ${nameCls(nm(b.id))}" style="color:${sideColor(b)}">${sideTag(b.infoText?.text)}${esc(nm(b.id))}</span></div><div class="round"><b>ROUND ${S.delayedRound ?? (a.score + b.score + 1)}</b> · ${esc(g.centeredInfoText || g.mapName || '')} · <b>${clockTxt}</b> · ${esc(g.status || '')}</div>`; }
+
+      if (g) {
+        const [a, b] = ordD(g.teams); const nm = (id) => (S.teamsBoard?.teams || sb.series?.teams || []).find(x => x.id === id)?.name || id;
+        dHead = `<div class="dsc"><div class="dt l" style="color:${sideColor(a)}">${logo(a.id)}<span class="dtn ${nameCls(nm(a.id))}" title="${esc(nm(a.id))}">${esc(nm(a.id))}</span>${sideTag(a.infoText?.text)}</div>` +
+          `<div class="dnum"><b style="color:${sideColor(a)}">${a.score}</b><i>:</i><b style="color:${sideColor(b)}">${b.score}</b></div>` +
+          `<div class="dt r" style="color:${sideColor(b)}">${sideTag(b.infoText?.text)}<span class="dtn ${nameCls(nm(b.id))}" title="${esc(nm(b.id))}">${esc(nm(b.id))}</span>${logo(b.id)}</div></div>`;
+        // The line under the score is rewritten every second (the clock), so it holds no picture.
+        let clockTxt = '';
+        if (S.clock) { let sec = S.clock.seconds; if (S.clock.ticking) { const el = (now() - S.clock.recvT) / 1000; sec = S.clock.backwards ? sec - el : sec + el; } clockTxt = `⏱ ${mmss(sec)}${S.clock.ticking ? '' : ' (paused)'}`; }
+        // Bomb planted: the clock itself becomes the marker, a red pill that blinks. Rewriting
+        // the line restarts a CSS animation, hence the negative delay that keeps it in phase.
+        if (rs.bomb) clockTxt = `<span class="bomb" style="animation-delay:-${now() % 1000}ms" title="${esc(rs.bomb.by ? 'bomb planted by ' + rs.bomb.by : 'bomb planted')}">💣 ${S.clock ? clockTxt.replace('⏱ ', '') : 'BOMB'}</span>`;
+        const rawMap = g.centeredInfoText || g.mapName || ''; const mb = mapBackground(g.mapName || g.centeredInfoText);
+        dMeta = `<b>ROUND ${S.delayedRound ?? (a.score + b.score + 1)}</b><span class="dot">·</span><span${mb.tip ? ` title="${esc(mb.tip)}"` : ''}>${esc(prettyMap(rawMap))}</span>${clockTxt ? `<span class="dot">·</span><b class="dclock">${clockTxt}</b>` : ''}<span class="dot">·</span>${S.boardDelay === 0 ? '<span class="dchip live" title="GRID sends the score, the sides and the round clock without delay. The players, the kills and the live log below arrive later.">LIVE</span>' : `<span class="dchip" title="GRID is sending the score and the clock with this delay.">DELAYED${S.boardDelay != null ? ' ' + S.boardDelay + 's' : ''}</span>`}${g.status ? ` <span class="dim">${esc(g.status)}</span>` : ''}`;
+        const k = mb.css; if (bg.dataset.k !== k) { bg.dataset.k = k; bg.style.backgroundImage = k; bg.className = 'mapbg' + (mb.img ? ' pic' : ''); }
+      }
+
       if (tb) {
-        dTabs = `<div class="tabs"><button data-tab="players" class="${tab === 'players' ? 'on' : ''}">Players</button><button data-tab="loadout" class="${tab === 'loadout' ? 'on' : ''}">Loadout</button></div>`;
-        const hasHp = (tb.teams || []).some(tm => (tm.players || []).some(p => p.primaryFillBar));
-        const rs = hasHp ? { known: false, dead: new Map(), kills: new Map() } : rsAll;
-        dTable = tab === 'players' ? `<table><colgroup><col style="width:36%"><col style="width:18%"><col style="width:18%"><col style="width:28%"></colgroup><tr><th>player</th><th>side/operator</th><th class="c">K/D/A</th><th class="rr">${hasHp ? 'HP' : rs.known ? 'this round' : ''}</th></tr>` : '<table><colgroup><col style="width:30%"><col style="width:18%"><col style="width:52%"></colgroup><tr><th>player</th><th>side/operator</th><th>loadout</th></tr>';
+        const behind = measured != null ? measured : S.declaredDelay;
+        dTabs = `<div class="tabs"><button data-tab="players" class="${tab === 'players' ? 'on' : ''}">Players</button><button data-tab="loadout" class="${tab === 'loadout' ? 'on' : ''}">Loadout</button><span class="sp"></span>${behind ? `<span class="dchip" title="Players, K/D/A, kills, who is alive and the bomb come from GRID's delayed feeds: what you see here happened about this long ago.">PLAYERS ${measured != null ? '~' : ''}${behind}s BEHIND</span>` : ''}</div>`;
+        const all = (tb.teams || []).flatMap(tm => tm.players || []);
+        const hasHp = all.some(p => p.primaryFillBar);
+        // An operator is a character that is not just the side's name (CS2 sends "Terrorist").
+        const hasOp = all.some(p => p.character && p.character.label && !/terrorist/i.test(p.character.label));
+        const hpOf = (p) => p.primaryFillBar ? Math.round((p.primaryFillBar.fillFraction || 0) * 100) : null;
+        const deadOf = (p) => { const hp = hpOf(p); return hp != null ? hp === 0 : (rs.known && isDead(rs, p)); };
+        const nameOf = (p) => 'n:' + String(p.name || '').toLowerCase();
+        dTable = `<div class="dteams${hasOp ? ' has-op' : ''}${hasHp ? ' has-hp' : ''}${tab === 'loadout' ? ' is-lo' : ''}">`;
         for (const team of ordD(tb.teams || [])) {
           const gt = g ? g.teams.find(x => x.id === team.id) : null; const side = gt && gt.infoText ? gt.infoText.text : ''; const kda = (team.dataPoints || []).find(d => d.label === 'K/D/A')?.value || '';
           const players = team.players || [];
-          const hpOf = (p) => p.primaryFillBar ? Math.round((p.primaryFillBar.fillFraction || 0) * 100) : null;
-          const deadOf = (p) => { const hp = hpOf(p); return hp != null ? hp === 0 : (rs.known && isDead(rs, p)); };
-          const aliveTxt = hasHp || rs.known ? ` <span class="dim">· alive</span> ${players.filter(p => !deadOf(p)).length}/${players.length}` : '';
-          dTable += `<tr class="team"><td colspan="${tab === 'players' ? 4 : 3}" style="color:${gt ? sideColor(gt) : colorOf(team.id)}">${esc(team.name)}${sideTag(side)} <span class="dim">${esc(kda)}</span>${aliveTxt}</td></tr>`;
+          const alive = (hasHp || rs.known) && tab === 'players' ? `<i class="sep">|</i><span class="dal"><span class="lbl">ALIVE </span><b>${players.filter(p => !deadOf(p)).length}/${players.length}</b></span>` : '';
+          const caps = tab === 'players' ? `<span class="dcap c">${hasOp ? '<span class="w">OPERATOR</span><span class="n">OP</span>' : ''}</span><span class="dcap c">K / D / A</span><span class="dcap"></span><span class="dcap r">${hasHp ? 'HP' : ''}</span>` : `<span class="dcap c">${hasOp ? '<span class="w">OPERATOR</span><span class="n">OP</span>' : ''}</span><span class="dcap">LOADOUT</span>`;
+          dTable += `<div class="dteam" style="--sc:${gt ? sideColor(gt) : colorOf(team.id)}"><div class="dband drow"><span class="dbl">${logo(team.id, 'sm')}<span class="dbn" title="${esc(team.name)}">${esc(team.name)}</span>${sideTag(side)}${kda && tab === 'players' ? `<i class="sep dkt">|</i><span class="dkt" title="Team K/D/A">${esc(kda)}</span>` : ''}${alive}</span>${caps}</div>`;
           for (const p of players) {
-            const hp = hpOf(p), dead = deadOf(p); const op = p.character?.label || ''; const opSide = /terrorist/i.test(op) ? sideOf(op) : '';
-            const opCell = opSide ? `<span class="${opSide === 'CT' ? 'vct' : 'vt'}">${opSide}</span>` : esc(op);
+            const hp = hpOf(p), dead = deadOf(p);
+            const opCell = hasOp ? opHtml(operatorOf(p.character)) : '';
+            const head = `<span class="dn" title="${esc(p.name)}">${esc(p.name)}</span><span class="dop">${opCell}</span>`;
             if (tab === 'players') {
-              let stCell = '';
-              if (hp != null) stCell = `<span class="hpw"><span class="hp"><i style="width:${hp}%;background:${hp > 50 ? '#3fb950' : hp > 20 ? '#d29922' : '#ff7b72'}"></i></span><span class="hpn">${hp}</span></span>`;
-              else if (rs.known) { const by = dead ? (rs.dead.get(p.id) ?? rs.dead.get('n:' + String(p.name || '').toLowerCase()) ?? '') : ''; const rk = rs.kills.get(p.id) || 0; stCell = dead ? `<span class="st" title="${by ? 'killed by ' + esc(by) : 'dead'}"><span class="bad">✖</span> ${by ? esc(by) : 'dead'}</span>` : `<span class="st"><span class="ok">●</span>${rk ? ` ${rk}k` : ''}</span>`; }
-              dTable += `<tr class="${dead ? 'dead' : ''}"><td class="pn" title="${esc(p.name)}">${esc(p.name)}</td><td>${opCell}</td><td class="c">${esc((p.dataPoints || []).find(d => d.label === 'K/D/A')?.value || '')}</td><td class="rr">${stCell}</td></tr>`;
-            } else { const items = (p.items || []).map(i => i.label).filter(Boolean); dTable += `<tr class="${dead ? 'dead' : ''}"><td class="pn" title="${esc(p.name)}">${esc(p.name)}</td><td>${opCell}</td><td class="dim" title="${esc(items.join(', '))}">${esc(items.join(', '))}</td></tr>`; }
+              const by = dead && rs.known ? (rs.dead.get(p.id) ?? rs.dead.get(nameOf(p)) ?? '') : '';
+              const rk = rs.known ? (rs.kills.get(p.id) || rs.kills.get(nameOf(p)) || 0) : 0;
+              let st;
+              if (dead) st = skullIcon(by ? 'killed by ' + by : 'dead');
+              else if (hp != null) st = `<span class="hpw"><span class="hp"><i style="width:${hp}%;background:${hp > 50 ? '#3fb950' : hp > 20 ? '#d29922' : '#ff7b72'}"></i></span><span class="hpn">${hp}</span></span>`;
+              else st = rs.known ? '<span class="dpill" title="alive"></span>' : '';
+              dTable += `<div class="drow${dead ? ' dead' : ''}">${head}<span class="dk">${kdaHtml((p.dataPoints || []).find(d => d.label === 'K/D/A')?.value)}</span><span class="dcw">${killCards(rk)}</span><span class="dst">${st}</span></div>`;
+            } else { const items = (p.items || []).map(i => i.label).filter(Boolean).join(', '); dTable += `<div class="drow${dead ? ' dead' : ''}">${head}<span class="dlo" title="${esc(items)}">${esc(items)}</span></div>`; }
           }
+          dTable += '</div>';
         }
-        dTable += '</table>';
+        dTable += '</div>';
       }
     }
-    setHTML(hud.querySelector('#pm-del-head'), dHead); setHTML(hud.querySelector('#pm-del-tabs'), dTabs); setHTML(hud.querySelector('#pm-del-table'), dTable);
+    setHTML(hud.querySelector('#pm-del-head'), dHead); setHTML(hud.querySelector('#pm-del-meta'), dMeta); setHTML(hud.querySelector('#pm-del-tabs'), dTabs); setHTML(hud.querySelector('#pm-del-table'), dTable);
   }
+
+
+  // ---------------------------------------------------------------- stream
+  // The official player of the event's broadcast, as a frame of this page (Polymarket's own
+  // page shows the same players). Folded, hidden or without a stream, the frame is removed, so
+  // nothing plays out of sight. It starts muted.
+  const streamNow = () => S.gamma ? streamOf(S.gamma.source) : null;
+  function resetStream() { const box = hud && hud.querySelector('#pm-stream-box'); if (box) { box.dataset.src = ''; box.innerHTML = ''; } }
+  function paintStream() {
+    if (!hud) return;
+    const st = streamNow(); const box = hud.querySelector('#pm-stream-box');
+    const want = st && visibleHud && !isCollapsed('stream');
+    // Twitch wants the site the player sits in: this page's (the pop-out is this page's too).
+    const url = want ? st.player(location.hostname) : '';
+    if (box.dataset.src !== url) { box.dataset.src = url; box.innerHTML = url ? `<iframe src="${esc(url)}" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen title="stream"></iframe>` : ''; }
+    let host = ''; try { host = new URL(S.gamma ? S.gamma.source : '').hostname.replace(/^www\./, ''); } catch (e) { /* none */ }
+    hud.querySelector('#pm-stream-t').textContent = st ? `${st.label} · ${st.channel}` : S.gamma ? 'no stream for this event' : '';
+    box.style.display = st ? '' : 'none';
+    const msg = hud.querySelector('#pm-stream-msg');
+    msg.textContent = st ? '' : !S.gamma ? 'waiting for the event…' : `This event names no stream${host ? ` (its source is ${host})` : ''}. ▶ opens this match's page in a new tab instead.`;
+    const b = hud.querySelector('#pm-stream-open'); b.title = st ? `Open the stream (${st.label} · ${st.channel}) in a new tab` : 'Open this match page in a new tab (this event names no stream)';
+  }
+
 
   window.addEventListener('keydown', (e) => { if (e.ctrlKey && e.shiftKey && e.code === 'KeyR') { e.preventDefault(); toggle(); } }, true);
   function resetForNewEvent() {
@@ -873,7 +1269,7 @@
     S.market = null; S.pmMarkets = []; S.seriesId = null; S.gamma = null; S.gammaT = 0;
     // The real-time score too: up to 0.8.2 it stayed on screen after a switch, so the
     // previous match's score was shown until the new series-state arrived (or a reload).
-    S.live = null; S.liveT = 0; S.headlineKey = null; S.pageLogSeen = 0; S.sockState = {}; S.declaredDelay = null;
+    S.live = null; S.liveT = 0; S.headlineKey = null; S.pageLogSeen = 0; S.sockState = {}; S.declaredDelay = null; S.boardDelay = null;
     S.scoreboard = null; S.teamsBoard = null; S.colors = {}; S.log = []; S.veto = []; S.clock = null; S.delayedRound = null;
     S.frames = []; S.states = []; S.liveChanges = []; S.gammaLog = []; S.delaySamples = []; S.b365T = 0;
     Object.keys(cache).forEach(k => delete cache[k]);
@@ -896,5 +1292,5 @@
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onReady); else onReady();
   W.__pmR6 = { state: S, export: buildExport };
-  console.log(TAG, 'v0.10.9 installed (Ctrl+Shift+R toggles)');
+  console.log(TAG, 'v0.11.0 installed (Ctrl+Shift+R toggles)');
 })();
